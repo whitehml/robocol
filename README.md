@@ -7,7 +7,7 @@ implementation, with a few deviations.
 
 ## Workspace
 
-| crate | kind | what it is |
+| crate | kind | what |
 |---|---|---|
 | `robocol/` | lib | the protocol crate — six packet codecs, a threaded client (discovery -> heartbeat -> command ack/retransmit -> reconnection on one background thread, no async runtime), MJPEG camera decode. `std` + `serde` only. |
 | `fake_rc/` | bin | a standalone fake Robot Controller for hardware-free testing. |
@@ -40,5 +40,5 @@ end-to-end test needs no external binary.
 
 ## Packet capture
 
-`capture/` holds the packet-capture + triage tooling used to observe and
+`capture/` holds the packet-capture + inspection tooling used to observe and
 confirm the protocol.
