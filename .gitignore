@@ -1,0 +1,6 @@
+/target
+Cargo.lock.orig
+
+# Packet captures (kept out of the tree; only tooling is versioned)
+capture/captures/*.pcap
+capture/captures/*.pcapng

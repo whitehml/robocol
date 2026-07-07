@@ -1,0 +1,15 @@
+[package]
+name = "ds_cli"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Interactive Robocol client for a real FTC Control Hub"
+
+[[bin]]
+name = "ds_cli"
+path = "src/main.rs"
+
+[dependencies]
+robocol = { path = "../robocol" }
+# Only the CLI needs a line editor.
+rustyline = { version = "18.0.1", default-features = false }

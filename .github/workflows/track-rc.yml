@@ -1,0 +1,60 @@
+name: track-rc
+
+# Flags us when the FTC Robot Controller moves past the release robocol is
+# validated against. Should trigger whenever a new release is published upstream.
+
+on:
+  schedule:
+    - cron: "0 14 * * 1" # Mondays 14:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned release tag
+        id: pinned
+        run: |
+          tag="$(grep -oP 'Validated release tag \| `\K[^`]+' TODO || true)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch latest upstream release
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest="$(gh release view \
+            --repo FIRST-Tech-Challenge/FtcRobotController \
+            --json tagName --jq .tagName)"
+          echo "tag=$latest" >> "$GITHUB_OUTPUT"
+
+      - name: Compare and flag
+        if: steps.pinned.outputs.tag != steps.latest.outputs.tag && steps.pinned.outputs.tag != 'vTODO'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PINNED: ${{ steps.pinned.outputs.tag }}
+          LATEST: ${{ steps.latest.outputs.tag }}
+        run: |
+          title="RC $LATEST released — re-verify robocol (pinned $PINNED)"
+          if gh issue list --state open --search "$title in:title" --json number --jq 'length' | grep -qx 0; then
+            gh issue create --title "$title" --label rc-tracking --body "$(cat <<EOF
+          Upstream FtcRobotController is at \`$LATEST\`; robocol is validated
+          against \`$PINNED\`.
+
+          Re-verify the wire formats against the tracked source files, capture a
+          fresh session if anything changed, then bump and
+          \`robocol::tracked_rc::RELEASE_TAG\`.
+
+          Tracked source files to diff \`$PINNED..$LATEST\`:
+          RobocolConfig.java, Command.java, RobotCoreCommandList.java,
+          PeerDiscovery.java, Heartbeat.java, KeepAlive.java, Gamepad.java, and
+          the packet/datagram framing classes (see TRACKED_RC.md table).
+          EOF
+          )"
+          fi
