@@ -16,7 +16,7 @@ jobs:
   check-upstream:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Read pinned release tag
         id: pinned
