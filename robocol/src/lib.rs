@@ -60,8 +60,7 @@ pub const DEFAULT_PEER_ADDRS: [&str; 2] = ["192.168.43.1", "192.168.49.1"];
 
 pub mod tracked_rc {
     /// Upstream `FtcRobotController` release tag the code is validated against.
-    /// `None` until this repo is git-init'd and the first release is pinned.
-    pub const RELEASE_TAG: Option<&str> = None;
+    pub const RELEASE_TAG: Option<&str> = Some("v11.1");
 
     /// Upstream repository the release tag refers to.
     pub const UPSTREAM_REPO: &str = "FIRST-Tech-Challenge/FtcRobotController";

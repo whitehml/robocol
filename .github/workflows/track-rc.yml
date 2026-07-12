@@ -5,7 +5,7 @@ name: track-rc
 
 on:
   schedule:
-    - cron: "0 14 * * 1" # Mondays 14:00 UTC
+    - cron: "0 14 1 * *" # 1st of the month, 14:00 UTC
   workflow_dispatch:
 
 permissions:
@@ -21,7 +21,9 @@ jobs:
       - name: Read pinned release tag
         id: pinned
         run: |
-          tag="$(grep -oP 'Validated release tag \| `\K[^`]+' TODO || true)"
+          set -euo pipefail
+          tag="$(grep -oP 'RELEASE_TAG: Option<&str> = Some\("\K[^"]+' \
+            robocol/src/lib.rs || true)"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Fetch latest upstream release
@@ -29,18 +31,27 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           latest="$(gh release view \
             --repo FIRST-Tech-Challenge/FtcRobotController \
             --json tagName --jq .tagName)"
           echo "tag=$latest" >> "$GITHUB_OUTPUT"
 
+      - name: Warn if pin is unresolved
+        if: steps.pinned.outputs.tag == ''
+        run: echo "::warning::tracked_rc::RELEASE_TAG is unset in robocol/src/lib.rs; skipping compare"
+
       - name: Compare and flag
-        if: steps.pinned.outputs.tag != steps.latest.outputs.tag && steps.pinned.outputs.tag != 'vTODO'
+        if: steps.pinned.outputs.tag != '' && steps.pinned.outputs.tag != steps.latest.outputs.tag
         env:
           GH_TOKEN: ${{ github.token }}
           PINNED: ${{ steps.pinned.outputs.tag }}
           LATEST: ${{ steps.latest.outputs.tag }}
         run: |
+          set -euo pipefail
+          gh label create rc-tracking --color 5319e7 \
+            --description "Upstream FtcRobotController release tracking" --force
+
           title="RC $LATEST released — re-verify robocol (pinned $PINNED)"
           if gh issue list --state open --search "$title in:title" --json number --jq 'length' | grep -qx 0; then
             gh issue create --title "$title" --label rc-tracking --body "$(cat <<EOF
@@ -48,13 +59,13 @@ jobs:
           against \`$PINNED\`.
 
           Re-verify the wire formats against the tracked source files, capture a
-          fresh session if anything changed, then bump and
+          fresh session if anything changed, then bump
           \`robocol::tracked_rc::RELEASE_TAG\`.
 
           Tracked source files to diff \`$PINNED..$LATEST\`:
           RobocolConfig.java, Command.java, RobotCoreCommandList.java,
           PeerDiscovery.java, Heartbeat.java, KeepAlive.java, Gamepad.java, and
-          the packet/datagram framing classes (see TRACKED_RC.md table).
+          the packet/datagram framing classes.
           EOF
           )"
           fi
