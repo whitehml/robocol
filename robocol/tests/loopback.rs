@@ -27,16 +27,23 @@ fn wait_for<T>(rx: &Receiver<Event>, mut pick: impl FnMut(Event) -> Option<T>) -
 /// handshake, and acks the three connect-time auto-requests (active
 /// config, saved configs, OpMode list — matches the reference DS).
 fn connect() -> (RobocolClient, Receiver<Event>, UdpSocket, SocketAddr) {
+    connect_with(|_| {})
+}
+
+fn connect_with(
+    configure: impl FnOnce(&mut ClientConfig),
+) -> (RobocolClient, Receiver<Event>, UdpSocket, SocketAddr) {
     let rc = UdpSocket::bind("127.0.0.1:0").unwrap();
     rc.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let rc_port = rc.local_addr().unwrap().port();
 
-    let config = ClientConfig {
+    let mut config = ClientConfig {
         bind_port: 0,
         peer_addrs: vec!["127.0.0.1".parse().unwrap()],
         peer_port: rc_port,
         ..Default::default()
     };
+    configure(&mut config);
     let (client, events) = RobocolClient::start(config).unwrap();
 
     let mut buf = [0u8; 4096];
@@ -368,6 +375,101 @@ fn webcam_frame_reassembles_from_chunks_and_chains_next_request() {
             }
         }
     }
+
+    drop(client);
+}
+
+#[test]
+fn disconnect_timeout_fires_and_reconnects() {
+    let (client, events, rc, _ds_addr) = connect_with(|cfg| {
+        cfg.disconnect_timeout = Duration::from_millis(150);
+    });
+
+    wait_for(&events, |e| match e {
+        Event::Disconnected => Some(()),
+        _ => None,
+    });
+
+    let mut buf = [0u8; 4096];
+    loop {
+        let (n, from) = rc.recv_from(&mut buf).unwrap();
+        if let Ok(Packet::PeerDiscovery(_)) = Packet::parse(&buf[..n]) {
+            rc.send_to(&PeerDiscovery::default().serialize(), from)
+                .unwrap();
+            break;
+        }
+    }
+
+    wait_for(&events, |e| match e {
+        Event::Connected { .. } => Some(()),
+        _ => None,
+    });
+
+    drop(client);
+}
+
+#[test]
+fn unacked_command_is_retransmitted() {
+    let (client, _events, rc, _ds_addr) = connect_with(|cfg| {
+        cfg.command_retry_interval = Duration::from_millis(100);
+        cfg.command_max_attempts = 10;
+    });
+    let mut buf = [0u8; 4096];
+
+    client.init_opmode("Duo");
+
+    let first_seq = loop {
+        let (n, _) = rc.recv_from(&mut buf).unwrap();
+        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n]) {
+            if !c.acknowledged && c.name == cmd::INIT_OP_MODE {
+                break c.seq;
+            }
+        }
+    };
+
+    // Left unacked, the same command must show up again with a new seq
+    // once command_retry_interval elapses.
+    loop {
+        let (n, _) = rc.recv_from(&mut buf).unwrap();
+        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n]) {
+            if !c.acknowledged && c.name == cmd::INIT_OP_MODE {
+                assert_ne!(c.seq, first_seq);
+                break;
+            }
+        }
+    }
+
+    drop(client);
+}
+
+#[test]
+fn command_dropped_after_max_attempts() {
+    let (client, events, rc, _ds_addr) = connect_with(|cfg| {
+        cfg.command_retry_interval = Duration::from_millis(50);
+        cfg.command_max_attempts = 2;
+    });
+    let mut buf = [0u8; 4096];
+
+    client.init_opmode("Duo");
+
+    // Never ack it — just drain the retries off the wire so the RC socket
+    // doesn't back up while the client exhausts its attempts.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    rc.set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let dropped = loop {
+        assert!(Instant::now() < deadline, "timed out waiting for drop");
+        if let Ok((n, _)) = rc.recv_from(&mut buf) {
+            let _ = Packet::parse(&buf[..n]);
+        }
+        if let Ok(Some(name)) = events.try_recv().map(|e| match e {
+            Event::CommandDropped { name } => Some(name),
+            _ => None,
+        }) {
+            break name;
+        }
+    };
+    assert_eq!(dropped, cmd::INIT_OP_MODE);
 
     drop(client);
 }

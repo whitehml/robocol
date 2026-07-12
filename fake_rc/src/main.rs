@@ -539,14 +539,17 @@ fn main() {
                     let reply = PeerDiscovery::default().serialize();
                     let _ = rc.socket.send_to(&reply, from);
                 }
-                Ok(Packet::Heartbeat(mut hb)) => {
+                Ok(Packet::Heartbeat(mut hb)) if rc.ds == Some(from) => {
                     // Echo with our state, like the real RC.
                     hb.robot_state = rc.state;
                     hb.seq = rc.next_seq();
                     let _ = rc.socket.send_to(&hb.serialize(), from);
                 }
-                Ok(Packet::Command(c)) => rc.handle_command(c),
-                Ok(Packet::Gamepad(gp)) => {
+                Ok(Packet::Command(c)) if rc.ds == Some(from) => rc.handle_command(c),
+                Ok(Packet::Heartbeat(_) | Packet::Command(_)) => {
+                    println!("!! ignoring {from}: not the connected DS ({:?})", rc.ds);
+                }
+                Ok(Packet::Gamepad(gp)) if gp.user == 1 => {
                     if gp.left_stick_y != rc.left_stick_y {
                         println!("gamepad{} left_stick_y={}", gp.user, gp.left_stick_y);
                     }
@@ -568,13 +571,14 @@ fn main() {
                     rc.prev_x = gp.x;
                     rc.prev_y = gp.y;
                 }
+                Ok(Packet::Gamepad(_)) => {}
                 Ok(_) => {}
                 Err(e) => println!("!! parse error: {e}"),
             },
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => panic!("socket error: {e}"),
+            Err(e) => println!("!! socket error: {e}"),
         }
 
         if last_telemetry.elapsed() >= Duration::from_millis(100) {

@@ -30,7 +30,7 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         ClientConfig {
-            bind_port: 0,
+            bind_port: ROBOCOL_PORT,
             peer_addrs: DEFAULT_PEER_ADDRS
                 .iter()
                 .filter_map(|a| a.parse().ok())
@@ -223,6 +223,7 @@ struct PartialFrame {
 }
 
 const MAX_CONCURRENT_FRAMES: usize = 5;
+const MAX_PENDING_COMMANDS: usize = 64;
 const WEBCAM_STALL_TIMEOUT: Duration = Duration::from_millis(500);
 
 struct Worker {
@@ -280,6 +281,11 @@ impl Worker {
             if self.peer.is_some() && self.last_rx.elapsed() > self.cfg.disconnect_timeout {
                 self.peer = None;
                 self.robot_state = None;
+                self.pending.clear();
+                self.seen.clear();
+                self.webcam_frames.clear();
+                self.webcam_available = false;
+                self.webcam_pending_request = false;
                 if self.events.send(Event::Disconnected).is_err() {
                     return;
                 }
@@ -339,6 +345,10 @@ impl Worker {
         if command.timestamp == 0 {
             command.timestamp = now_nanos();
         }
+        if self.pending.len() >= MAX_PENDING_COMMANDS {
+            let name = self.pending.remove(0).command.name;
+            let _ = self.events.send(Event::CommandDropped { name });
+        }
         self.pending.push(PendingCommand {
             command,
             last_sent: None,
@@ -389,8 +399,15 @@ impl Worker {
     }
 
     fn handle_datagram(&mut self, data: &[u8], from: SocketAddr) -> bool {
-        if self.peer.is_some_and(|peer| peer != from) {
-            return true;
+        if let Some(peer) = self.peer {
+            if peer != from {
+                return self
+                    .events
+                    .send(Event::ProtocolError(format!(
+                        "ignored packet from {from}: connected peer is {peer}"
+                    )))
+                    .is_ok();
+            }
         }
         self.last_rx = Instant::now();
 
