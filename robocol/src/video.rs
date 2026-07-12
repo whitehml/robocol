@@ -572,7 +572,6 @@ mod tests {
         haystack.windows(needle.len()).position(|w| w == needle)
     }
 
-
     #[test]
     fn dechunks_large_multi_chunk_frames() {
         let mut jpeg = vec![0xFFu8, 0xD8];
