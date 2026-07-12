@@ -37,7 +37,8 @@
     clippy::must_use_candidate,
     clippy::struct_excessive_bools,
     clippy::large_stack_arrays,
-    clippy::needless_pass_by_value
+    clippy::needless_pass_by_value,
+    clippy::duration_suboptimal_units
 )]
 
 mod wire;
