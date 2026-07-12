@@ -28,6 +28,14 @@ cargo run -p ds_cli  [rc-ip]          # interactive CLI against a real Control H
 `UdpSocket` fake — discovery, acks both ways, telemetry, config CRUD — so the
 end-to-end test needs no external binary.
 
+## Lint
+
+```sh
+./scripts/lint.sh            # fmt --check, clippy, test
+./scripts/lint.sh --fix      # cargo fmt first, then the checks
+./scripts/lint.sh --no-test  # lint only, skip the test step
+```
+
 ## Supported Robot Controller versions
 
 **`11.0`–`11.1`**
