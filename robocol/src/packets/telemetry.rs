@@ -1,5 +1,14 @@
 //! Telemetry packet (uid 5): tagged bundles of string and float32 key/value
 //! pairs pushed by the RC (`telemetry.update()` on the robot side).
+//!
+//! LIBROBOCOL DEVIATION (real-hardware finding, not a librobocol mismatch):
+//! for ordinary OpMode `telemetry.addData`/`addLine` lines, the real RC keys
+//! each string entry by an opaque, monotonically increasing sort-order tag —
+//! not a caption — and bakes the full "Caption : Data" text into the *value*
+//! already. Only the reserved keys below (`BATTERY_LEVEL_KEY`,
+//! `SYSTEM_KEY_PREFIX`) carry a real, meaningful key. `strings` is a
+//! `Vec` rather than a map so that wire order (which the sort tags encode) is
+//! preserved rather than silently re-sorted by key bytes.
 
 use std::collections::BTreeMap;
 
@@ -20,7 +29,7 @@ pub struct Telemetry {
     pub is_sorted: bool,
     pub robot_state: RobotState,
     pub tag: String,
-    pub strings: BTreeMap<String, String>,
+    pub strings: Vec<(String, String)>,
     pub numbers: BTreeMap<String, f32>,
 }
 
@@ -32,13 +41,22 @@ impl Default for Telemetry {
             is_sorted: false,
             robot_state: RobotState::Unknown,
             tag: String::new(),
-            strings: BTreeMap::new(),
+            strings: Vec::new(),
             numbers: BTreeMap::new(),
         }
     }
 }
 
 impl Telemetry {
+    /// Pushes an ordinary (non-reserved) telemetry line the way the real RC
+    /// does: the caption is baked directly into `text` (e.g. `"FPS : 10.7"`)
+    /// and the key is an opaque, meaningless sort tag — never a real
+    /// caption. Only `BATTERY_LEVEL_KEY`/`SYSTEM_KEY_PREFIX` lines carry a
+    /// real key.
+    pub fn push_line(&mut self, text: impl Into<String>) {
+        self.strings.push((String::new(), text.into()));
+    }
+
     pub fn serialize(&self) -> Vec<u8> {
         let tag = self.tag.as_bytes();
         // LIBROBOCOL DEVIATION: librobocol sizes the payload as 9 + tag,
@@ -93,7 +111,7 @@ impl Telemetry {
             let (key, o) = wire::get_str_u16(buf, off)?;
             let (value, next) = wire::get_str_u16(buf, o)?;
             off = next;
-            t.strings.insert(key, value);
+            t.strings.push((key, value));
         }
 
         let number_count = wire::get_u8(buf, off)?;
@@ -109,7 +127,11 @@ impl Telemetry {
     }
 
     pub fn battery_voltage(&self) -> Option<f32> {
-        let raw = self.strings.get(BATTERY_LEVEL_KEY)?;
+        let raw = self
+            .strings
+            .iter()
+            .find(|(k, _)| k == BATTERY_LEVEL_KEY)
+            .map(|(_, v)| v.as_str())?;
         if raw == NO_VOLTAGE_SENSOR {
             return Some(0.0);
         }
@@ -131,8 +153,8 @@ mod tests {
             tag: "TELEMETRY_DATA".to_string(),
             ..Default::default()
         };
-        t.strings.insert("Alliance".into(), "RED".into());
-        t.strings.insert("State".into(), "DRIVING".into());
+        t.strings.push(("Alliance".into(), "RED".into()));
+        t.strings.push(("State".into(), "DRIVING".into()));
         t.numbers.insert("flywheel_rpm".into(), 2812.5);
         t.numbers.insert("heading_deg".into(), -42.0);
         assert_eq!(Telemetry::parse(&t.serialize()).unwrap(), t);
@@ -147,7 +169,7 @@ mod tests {
     #[test]
     fn battery_voltage_reads_real_capture_value() {
         let mut t = Telemetry::default();
-        t.strings.insert(BATTERY_LEVEL_KEY.into(), "12.06".into());
+        t.strings.push((BATTERY_LEVEL_KEY.into(), "12.06".into()));
         assert_eq!(t.battery_voltage(), Some(12.06));
     }
 
@@ -155,7 +177,7 @@ mod tests {
     fn battery_voltage_sentinel_is_zero() {
         let mut t = Telemetry::default();
         t.strings
-            .insert(BATTERY_LEVEL_KEY.into(), NO_VOLTAGE_SENSOR.into());
+            .push((BATTERY_LEVEL_KEY.into(), NO_VOLTAGE_SENSOR.into()));
         assert_eq!(t.battery_voltage(), Some(0.0));
     }
 

@@ -153,7 +153,7 @@ fn battery_voltage_arrives_over_telemetry() {
     };
     telemetry
         .strings
-        .insert(BATTERY_LEVEL_KEY.to_string(), "12.06".to_string());
+        .push((BATTERY_LEVEL_KEY.to_string(), "12.06".to_string()));
     rc.send_to(&telemetry.serialize(), ds_addr).unwrap();
 
     let received = wait_for(&events, |e| match e {

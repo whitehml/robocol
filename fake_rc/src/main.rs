@@ -235,35 +235,31 @@ impl FakeRc {
             is_sorted: true,
             robot_state: self.state,
             tag: "TELEMETRY_DATA".to_string(),
-            strings: BTreeMap::new(),
+            strings: Vec::new(),
             numbers: BTreeMap::new(),
         };
         let elapsed = self.started.elapsed().as_secs_f32();
         // Battery voltage rides every telemetry packet regardless of
         // OpMode state, same as a real Control Hub.
-        t.strings.insert(
+        t.strings.push((
             BATTERY_LEVEL_KEY.into(),
             format!("{:.2}", 12.8 - elapsed * 0.0005),
-        );
+        ));
         // RC-originated system telemetry: present whenever connected, no
         // matter the OpMode state, like a real hub's own status lines.
-        t.strings.insert(
+        t.strings.push((
             format!("{SYSTEM_KEY_PREFIX}i2c"),
             "1 device on the I2C bus".into(),
-        );
+        ));
         match self.state {
             RobotState::Init => {
-                t.strings.insert("00 OpMode".into(), self.opmode.clone());
-                t.strings.insert("01 Alliance".into(), self.alliance.into());
-                t.strings
-                    .insert("02 Start Position".into(), self.start_position.into());
-                t.strings.insert(
-                    "03 Hint".into(),
-                    "X toggles alliance, Y toggles start".into(),
-                );
+                t.push_line(format!("00 OpMode : {}", self.opmode));
+                t.push_line(format!("01 Alliance : {}", self.alliance));
+                t.push_line(format!("02 Start Position : {}", self.start_position));
+                t.push_line("03 Hint : X toggles alliance, Y toggles start");
             }
             RobotState::Running => {
-                t.strings.insert("State".into(), "DRIVING".into());
+                t.push_line("State : DRIVING");
                 t.numbers.insert(
                     "flywheel_rpm".into(),
                     2800.0 + 300.0 * (elapsed * 2.0).sin(),
