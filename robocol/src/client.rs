@@ -2,7 +2,7 @@
 //! acks and retransmits commands, and surfaces everything as [`Event`]s on
 //! an mpsc channel. Not an async runtime, one background thread.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::cmd::{self, OpModeMeta};
 use crate::packets::{Command, Gamepad, Heartbeat, Packet, PeerDiscovery};
 use crate::types::RobotState;
+use crate::video::MAX_FRAME_BYTES;
 use crate::{DEFAULT_PEER_ADDRS, ROBOCOL_PORT};
 
 #[derive(Debug, Clone)]
@@ -23,6 +24,7 @@ pub struct ClientConfig {
     pub disconnect_timeout: Duration,
     pub command_retry_interval: Duration,
     pub command_max_attempts: u32,
+    pub webcam_min_frame_interval: Duration,
 }
 
 impl Default for ClientConfig {
@@ -38,6 +40,7 @@ impl Default for ClientConfig {
             disconnect_timeout: Duration::from_secs(3),
             command_retry_interval: Duration::from_millis(500),
             command_max_attempts: 10,
+            webcam_min_frame_interval: Duration::from_secs_f64(1.0 / 30.0),
         }
     }
 }
@@ -61,6 +64,8 @@ pub enum Event {
     Command { name: String, extra: String },
     CommandDropped { name: String },
     ProtocolError(String),
+    WebcamAvailable(bool),
+    WebcamFrame(Vec<u8>),
 }
 
 enum Control {
@@ -95,6 +100,11 @@ impl RobocolClient {
                     seq: 0,
                     pending: Vec::new(),
                     seen: VecDeque::new(),
+                    webcam_available: false,
+                    webcam_frames: BTreeMap::new(),
+                    webcam_pending_request: false,
+                    last_webcam_request: None,
+                    debug: std::env::var_os("DECK_VIDEO_DEBUG").is_some(),
                 }
                 .run();
             })?;
@@ -185,6 +195,10 @@ impl RobocolClient {
     pub fn discover_lynx_modules(&self, serial: &str) {
         self.send_command(cmd::DISCOVER_LYNX_MODULES, serial);
     }
+
+    pub fn request_webcam_frame(&self) {
+        self.send_command(cmd::REQUEST_FRAME, "");
+    }
 }
 
 impl Drop for RobocolClient {
@@ -202,6 +216,15 @@ struct PendingCommand {
     attempts: u32,
 }
 
+struct PartialFrame {
+    data: Vec<u8>,
+    received: Vec<bool>,
+    remaining: usize,
+}
+
+const MAX_CONCURRENT_FRAMES: usize = 5;
+const WEBCAM_STALL_TIMEOUT: Duration = Duration::from_millis(500);
+
 struct Worker {
     cfg: ClientConfig,
     socket: UdpSocket,
@@ -214,6 +237,11 @@ struct Worker {
     seq: u16,
     pending: Vec<PendingCommand>,
     seen: VecDeque<(String, i64)>,
+    webcam_available: bool,
+    webcam_frames: BTreeMap<i32, PartialFrame>,
+    webcam_pending_request: bool,
+    last_webcam_request: Option<Instant>,
+    debug: bool,
 }
 
 impl Worker {
@@ -263,6 +291,22 @@ impl Worker {
             {
                 self.last_beat = Some(Instant::now());
                 self.tick();
+            }
+            if self.webcam_pending_request
+                && self
+                    .last_webcam_request
+                    .is_none_or(|t| t.elapsed() >= self.cfg.webcam_min_frame_interval)
+            {
+                self.webcam_pending_request = false;
+                self.send_webcam_request();
+            } else if self.webcam_available
+                && !self.webcam_pending_request
+                && self
+                    .last_webcam_request
+                    .is_some_and(|t| t.elapsed() >= WEBCAM_STALL_TIMEOUT)
+            {
+                self.webcam_frames.clear();
+                self.request_webcam_frame_paced();
             }
             if !self.retransmit_pending() {
                 return;
@@ -409,32 +453,166 @@ impl Worker {
         let ack = Command::ack_of(&command);
         let _ = self.socket.send_to(&ack.serialize(), from);
 
-        let key = (command.name.clone(), command.timestamp);
-        if self.seen.contains(&key) {
-            return true;
-        }
-        self.seen.push_back(key);
-        if self.seen.len() > 32 {
-            self.seen.pop_front();
+        let is_frame = matches!(
+            command.name.as_str(),
+            cmd::RECEIVE_FRAME_BEGIN | cmd::RECEIVE_FRAME_CHUNK
+        );
+        if !is_frame {
+            let key = (command.name.clone(), command.timestamp);
+            if self.seen.contains(&key) {
+                return true;
+            }
+            self.seen.push_back(key);
+            if self.seen.len() > 64 {
+                self.seen.pop_front();
+            }
         }
 
-        let event = match command.name.as_str() {
-            cmd::NOTIFY_OP_MODE_LIST => Event::OpModeList(cmd::parse_opmode_list(&command.extra)),
-            cmd::NOTIFY_INIT_OP_MODE => Event::OpModeInited(command.extra),
-            cmd::NOTIFY_RUN_OP_MODE => Event::OpModeRunning(command.extra),
-            cmd::NOTIFY_ACTIVE_CONFIGURATION => Event::ActiveConfiguration(command.extra),
-            cmd::REQUEST_CONFIGURATIONS_RESP => Event::ConfigurationList(command.extra),
-            cmd::REQUEST_PARTICULAR_CONFIGURATION_RESP => Event::Configuration(command.extra),
-            cmd::NOTIFY_USER_DEVICE_LIST => Event::UserDeviceList(command.extra),
-            cmd::SCAN_RESP => Event::ScanResult(command.extra),
-            cmd::DISCOVER_LYNX_MODULES_RESP => Event::LynxModules(command.extra),
-            cmd::SHOW_STACKTRACE => Event::Stacktrace(command.extra),
-            _ => Event::Command {
+        let event: Option<Event> = match command.name.as_str() {
+            cmd::NOTIFY_OP_MODE_LIST => {
+                Some(Event::OpModeList(cmd::parse_opmode_list(&command.extra)))
+            }
+            cmd::NOTIFY_INIT_OP_MODE => Some(Event::OpModeInited(command.extra)),
+            cmd::NOTIFY_RUN_OP_MODE => Some(Event::OpModeRunning(command.extra)),
+            cmd::NOTIFY_ACTIVE_CONFIGURATION => Some(Event::ActiveConfiguration(command.extra)),
+            cmd::REQUEST_CONFIGURATIONS_RESP => Some(Event::ConfigurationList(command.extra)),
+            cmd::REQUEST_PARTICULAR_CONFIGURATION_RESP => Some(Event::Configuration(command.extra)),
+            cmd::NOTIFY_USER_DEVICE_LIST => Some(Event::UserDeviceList(command.extra)),
+            cmd::SCAN_RESP => Some(Event::ScanResult(command.extra)),
+            cmd::DISCOVER_LYNX_MODULES_RESP => Some(Event::LynxModules(command.extra)),
+            cmd::SHOW_STACKTRACE => Some(Event::Stacktrace(command.extra)),
+            cmd::STREAM_CHANGE => Some(self.handle_stream_change(&command.extra)),
+            cmd::RECEIVE_FRAME_BEGIN => {
+                self.handle_frame_begin(&command.extra);
+                None
+            }
+            cmd::RECEIVE_FRAME_CHUNK => self.handle_frame_chunk(&command.extra),
+            _ => Some(Event::Command {
                 name: command.name,
                 extra: command.extra,
-            },
+            }),
         };
-        self.events.send(event).is_ok()
+        match event {
+            Some(event) => self.events.send(event).is_ok(),
+            None => true,
+        }
+    }
+
+    fn handle_stream_change(&mut self, extra: &str) -> Event {
+        let available = extra.trim() == "true";
+        eprintln!("webcam: RC stream availability -> {available}");
+        self.webcam_available = available;
+        if available {
+            self.request_webcam_frame_paced();
+        } else {
+            self.webcam_frames.clear();
+            self.webcam_pending_request = false;
+        }
+        Event::WebcamAvailable(available)
+    }
+
+    fn request_webcam_frame_paced(&mut self) {
+        if self
+            .last_webcam_request
+            .is_none_or(|t| t.elapsed() >= self.cfg.webcam_min_frame_interval)
+        {
+            self.send_webcam_request();
+        } else {
+            self.webcam_pending_request = true;
+        }
+    }
+
+    fn send_webcam_request(&mut self) {
+        self.last_webcam_request = Some(Instant::now());
+        self.queue_command(Command::new(cmd::REQUEST_FRAME, "", 0));
+    }
+
+    fn handle_frame_begin(&mut self, extra: &str) {
+        let Ok(begin) = serde_json::from_str::<cmd::FrameBegin>(extra) else {
+            if self.debug {
+                eprintln!("webcam: FRAME_BEGIN parse failed: {extra}");
+            }
+            return;
+        };
+        if self.debug {
+            eprintln!(
+                "webcam: FRAME_BEGIN frame={} length={}",
+                begin.frame_num, begin.length
+            );
+        }
+        let Ok(length) = usize::try_from(begin.length) else {
+            return;
+        };
+        if length > MAX_FRAME_BYTES {
+            return;
+        }
+        let chunk_count = length.div_ceil(cmd::FRAME_CHUNK_SIZE);
+        self.webcam_frames.insert(
+            begin.frame_num,
+            PartialFrame {
+                data: vec![0u8; length],
+                received: vec![false; chunk_count],
+                remaining: chunk_count,
+            },
+        );
+        while self.webcam_frames.len() > MAX_CONCURRENT_FRAMES {
+            let Some(&oldest) = self.webcam_frames.keys().next() else {
+                break;
+            };
+            self.webcam_frames.remove(&oldest);
+        }
+    }
+
+    fn handle_frame_chunk(&mut self, extra: &str) -> Option<Event> {
+        let chunk = match serde_json::from_str::<cmd::FrameChunk>(extra) {
+            Ok(c) => c,
+            Err(e) => {
+                if self.debug {
+                    let head: String = extra.chars().take(80).collect();
+                    eprintln!("webcam: FRAME_CHUNK parse failed: {e}; extra starts: {head}");
+                }
+                return None;
+            }
+        };
+        let Some(bytes) = crate::base64::decode(&chunk.encoded_data) else {
+            if self.debug {
+                eprintln!(
+                    "webcam: base64 decode failed frame={} chunk={} (len={})",
+                    chunk.frame_num,
+                    chunk.chunk_num,
+                    chunk.encoded_data.len()
+                );
+            }
+            return None;
+        };
+        let index = usize::try_from(chunk.chunk_num).ok()?;
+        let partial = self.webcam_frames.get_mut(&chunk.frame_num)?;
+        if index >= partial.received.len() || partial.received[index] {
+            return None;
+        }
+        let offset = index * cmd::FRAME_CHUNK_SIZE;
+        if offset + bytes.len() > partial.data.len() {
+            return None;
+        }
+        partial.data[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        partial.received[index] = true;
+        partial.remaining -= 1;
+        if partial.remaining > 0 {
+            return None;
+        }
+        let complete = self.webcam_frames.remove(&chunk.frame_num)?;
+        self.webcam_frames.retain(|&num, _| num > chunk.frame_num);
+        if self.webcam_available {
+            self.request_webcam_frame_paced();
+        }
+        if self.debug {
+            eprintln!(
+                "webcam: frame {} complete ({} bytes)",
+                chunk.frame_num,
+                complete.data.len()
+            );
+        }
+        Some(Event::WebcamFrame(complete.data))
     }
 
     fn next_seq(&mut self) -> u16 {

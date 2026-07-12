@@ -289,3 +289,85 @@ fn save_configuration_does_not_restart_robot() {
 
     drop(client);
 }
+
+#[test]
+fn webcam_frame_reassembles_from_chunks_and_chains_next_request() {
+    let (client, events, rc, ds_addr) = connect();
+    let mut buf = [0u8; 65536];
+
+    rc.send_to(
+        &Command::new(cmd::STREAM_CHANGE, "true", 1).serialize(),
+        ds_addr,
+    )
+    .unwrap();
+    wait_for(&events, |e| match e {
+        Event::WebcamAvailable(true) => Some(()),
+        _ => None,
+    });
+
+    // The client should have auto-requested a frame as soon as it learned
+    // the stream is available.
+    loop {
+        let (n, _) = rc.recv_from(&mut buf).unwrap();
+        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n]) {
+            if !c.acknowledged && c.name == cmd::REQUEST_FRAME {
+                rc.send_to(&Command::ack_of(&c).serialize(), ds_addr)
+                    .unwrap();
+                break;
+            }
+        }
+    }
+
+    let jpeg: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
+    let begin = cmd::FrameBegin {
+        frame_num: 1,
+        length: jpeg.len() as i32,
+    };
+    rc.send_to(
+        &Command::new(
+            cmd::RECEIVE_FRAME_BEGIN,
+            &serde_json::to_string(&begin).unwrap(),
+            2,
+        )
+        .serialize(),
+        ds_addr,
+    )
+    .unwrap();
+
+    for (chunk_num, chunk) in jpeg.chunks(cmd::FRAME_CHUNK_SIZE).enumerate() {
+        let payload = cmd::FrameChunk {
+            frame_num: 1,
+            chunk_num: chunk_num as i32,
+            encoded_data: robocol::base64::encode(chunk),
+        };
+        rc.send_to(
+            &Command::new(
+                cmd::RECEIVE_FRAME_CHUNK,
+                &serde_json::to_string(&payload).unwrap(),
+                3 + chunk_num as i64,
+            )
+            .serialize(),
+            ds_addr,
+        )
+        .unwrap();
+    }
+
+    let received = wait_for(&events, |e| match e {
+        Event::WebcamFrame(jpeg) => Some(jpeg),
+        _ => None,
+    });
+    assert_eq!(received, jpeg);
+
+    // Completing a frame while still available should chain another
+    // request, without needing an external poller.
+    loop {
+        let (n, _) = rc.recv_from(&mut buf).unwrap();
+        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n]) {
+            if !c.acknowledged && c.name == cmd::REQUEST_FRAME {
+                break;
+            }
+        }
+    }
+
+    drop(client);
+}

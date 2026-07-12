@@ -29,7 +29,6 @@
 #![allow(
     clippy::doc_markdown,
     clippy::missing_errors_doc,
-    clippy::missing_panics_doc,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_possible_wrap,
@@ -43,6 +42,7 @@
 
 mod wire;
 
+pub mod base64;
 pub mod client;
 pub mod cmd;
 pub mod packets;

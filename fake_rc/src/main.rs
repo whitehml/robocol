@@ -5,13 +5,13 @@
 //! pattern: pressing gamepad X toggles alliance, Y toggles start position,
 //! echoed back through telemetry.
 //!
-//! It also runs two always-on MJPEG-over-HTTP camera servers — a Limelight
-//! stand-in on :5800 and a webcam stand-in on :8080 — so the DS video panes
-//! have a real stream to decode without hardware.
+//! It also runs an always-on Limelight MJPEG-over-HTTP stand-in on :5800, and
+//! emulates the RC webcam's Robocol-native `CameraStreamServer` protocol
+//! whenever an OpMode is init'd/running.
 //!
 //! ```sh
-//! cargo run --example fake_rc              # binds 127.0.0.1:20884
-//! cargo run --example fake_rc 20900        # custom port
+//! cargo run -p fake_rc              # binds 127.0.0.1:20884
+//! cargo run -p fake_rc 20900        # custom port
 //! ```
 //! Point the Godot client at it with:
 //! `DECK_DS_PEER=127.0.0.1 DECK_DS_BIND_PORT=0 godot4 --path godot`
@@ -31,11 +31,7 @@ use robocol::packets::{
 use robocol::types::RobotState;
 use robocol::ROBOCOL_PORT;
 
-/// Camera stream ports mirror real hardware: the Limelight serves MJPEG on
-/// 5800, the RC's webcam server on 8080. Content is a synthetic test pattern,
-/// always published (this fake is purely for exercising the DS video path).
 const LIMELIGHT_PORT: u16 = 5800;
-const WEBCAM_PORT: u16 = 8080;
 const CAM_WIDTH: u16 = 320;
 const CAM_HEIGHT: u16 = 240;
 const CAM_FRAME_INTERVAL: Duration = Duration::from_millis(83);
@@ -72,7 +68,7 @@ const FAKE_CONFIG_XML: &str = r#"<?xml version='1.0' encoding='UTF-8' standalone
 </Robot>"#;
 
 /// Canned CMD_SCAN_RESP: a scanned hardware tree that includes an
-/// EthernetDevice (the Limelight "Ethernet Device" the config flow renames).
+/// EthernetDevice.
 const SCAN_XML: &str = r#"<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
 <Robot type="FirstInspires-FTC">
     <LynxUsbDevice name="Control Hub Portal" serialNumber="(embedded)" parentModuleAddress="173">
@@ -119,6 +115,8 @@ struct FakeRc {
     /// follows — matches real hardware, where activation only takes
     /// effect after a restart.
     pending_activation: Option<ConfigMeta>,
+    webcam_available: bool,
+    webcam_frame_num: i32,
 }
 
 impl FakeRc {
@@ -153,9 +151,11 @@ impl FakeRc {
                 if command.extra == cmd::DEFAULT_OP_MODE {
                     self.state = RobotState::Stopped;
                     self.opmode.clear();
+                    self.set_webcam_available(false);
                 } else {
                     self.state = RobotState::Init;
                     self.opmode = command.extra.clone();
+                    self.set_webcam_available(true);
                 }
                 self.send_command(cmd::NOTIFY_INIT_OP_MODE, &command.extra);
             }
@@ -167,12 +167,18 @@ impl FakeRc {
             cmd::RESTART_ROBOT => {
                 self.state = RobotState::NotStarted;
                 self.opmode.clear();
+                self.set_webcam_available(false);
                 if let Some(meta) = self.pending_activation.take() {
                     self.active_config = meta.clone();
                     self.send_command(
                         cmd::NOTIFY_ACTIVE_CONFIGURATION,
                         &serde_json::to_string(&meta).unwrap(),
                     );
+                }
+            }
+            cmd::REQUEST_FRAME => {
+                if self.webcam_available {
+                    self.send_webcam_frame();
                 }
             }
             cmd::REQUEST_ACTIVE_CONFIG => {
@@ -225,6 +231,41 @@ impl FakeRc {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn set_webcam_available(&mut self, available: bool) {
+        if self.webcam_available == available {
+            return;
+        }
+        self.webcam_available = available;
+        self.send_command(cmd::STREAM_CHANGE, if available { "true" } else { "false" });
+    }
+
+    fn send_webcam_frame(&mut self) {
+        let frame_num = self.webcam_frame_num;
+        self.webcam_frame_num = self.webcam_frame_num.wrapping_add(1);
+        let jpeg = render_frame("webcam", frame_num as u64);
+
+        let begin = cmd::FrameBegin {
+            frame_num,
+            length: jpeg.len() as i32,
+        };
+        self.send_command(
+            cmd::RECEIVE_FRAME_BEGIN,
+            &serde_json::to_string(&begin).unwrap(),
+        );
+
+        for (chunk_num, chunk) in jpeg.chunks(cmd::FRAME_CHUNK_SIZE).enumerate() {
+            let payload = cmd::FrameChunk {
+                frame_num,
+                chunk_num: chunk_num as i32,
+                encoded_data: robocol::base64::encode(chunk),
+            };
+            self.send_command(
+                cmd::RECEIVE_FRAME_CHUNK,
+                &serde_json::to_string(&payload).unwrap(),
+            );
         }
     }
 
@@ -444,7 +485,6 @@ fn main() {
     println!("fake_rc listening on 127.0.0.1:{port}");
 
     spawn_mjpeg_server(LIMELIGHT_PORT, "limelight");
-    spawn_mjpeg_server(WEBCAM_PORT, "webcam");
 
     let mut rc = FakeRc {
         socket,
@@ -482,6 +522,8 @@ fn main() {
         saved_xml: HashMap::new(),
         next_resource_id: 1,
         pending_activation: None,
+        webcam_available: false,
+        webcam_frame_num: 0,
     };
 
     let mut buf = [0u8; 4096];

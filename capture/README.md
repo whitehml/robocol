@@ -37,19 +37,24 @@ whatever port/path it really uses:
 sudo tcpdump -i wlp3s0 -w capture/captures/camera.pcap 'host <camera-ip>'
 ```
 
-- **Limelight** (its own device, port 5800): the URL is known, so pull it while
-  capturing to confirm the framing against `video.rs`:
+- **Limelight**: its reachable host depends on what it's plugged 
+  into — `limelight.local` (mDNS) when it's wired straight to this machine,
+  `192.168.43.1` behind a Control Hub, or `192.168.49.1` behind an RC phone.
+  It serves two always-on MJPEG streams at the root path: the annotated 
+  feed on **5800** and the raw feed on **5802**. Confirmed via
+  `curl -s --max-time 2 -D - -o /dev/null http://<limelight-ip>:5800/`
+  (look for `Content-Type: multipart/x-mixed-replace;boundary=...` and
+  `Server: CameraServer/1.0`):
 
   ```sh
   curl "$DECK_LIMELIGHT_STREAM" -o /dev/null    # Ctrl-C after a few frames
   ```
 
-- **RC webcam** (served by RobotServer): the endpoint URL is still unknown, so
-  the capture is how you find it. Open the RC's web console at
-  `http://<rc-ip>:8080/` in a browser and start its camera stream; the captured
-  request URI is the endpoint for `DECK_WEBCAM_STREAM`, and its `Content-Type`
-  confirms or refutes the `multipart/x-mixed-replace` MJPEG framing `video.rs`
-  assumes.
+- **RC webcam**: not HTTP — it isn't reachable at any port at all. It rides
+  Robocol itself (`CMD_REQUEST_FRAME` / `CMD_STREAM_CHANGE` /
+  `CMD_RECEIVE_FRAME_*` over the same UDP/20884 traffic `ds_cli` capture above
+  already gets), chunked JPEGs reassembled in `robocol::client`.
 
-Inspect with `analyze.sh` (it flags MJPEG multipart responses and their request
-URIs), or open the `.pcap` in Wireshark and `Follow -> HTTP Stream`.
+Inspect the Limelight capture with `analyze.sh` (it flags MJPEG multipart
+responses and their request URIs), or open the `.pcap` in Wireshark and
+`Follow -> HTTP Stream`.

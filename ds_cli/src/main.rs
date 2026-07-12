@@ -2,8 +2,8 @@
 //!
 //! Join the Control Hub's WiFi AP, then:
 //! ```sh
-//! cargo run --example ds_cli            # tries 192.168.43.1 / 192.168.49.1
-//! cargo run --example ds_cli 10.0.0.5   # explicit RC address
+//! cargo run -p ds_cli            # tries 192.168.43.1 / 192.168.49.1
+//! cargo run -p ds_cli 10.0.0.5   # explicit RC address
 //! ```
 //! Commands: `list`, `init <name>`, `run`, `stop`, `restart`, `quit`,
 //! `active-config`, `configs`, `config <name>`, `save-config <json>`,
@@ -103,6 +103,8 @@ fn main() {
                 Event::Command { name, extra } => format!("<< command {name}: {extra}"),
                 Event::CommandDropped { name } => format!("!! command {name} never acked"),
                 Event::ProtocolError(e) => format!("!! protocol error: {e}"),
+                Event::WebcamAvailable(available) => format!("<< webcam available: {available}"),
+                Event::WebcamFrame(jpeg) => format!("<< webcam frame: {} bytes", jpeg.len()),
             };
             printer.print(format!("{line}\n")).ok();
         }

@@ -17,6 +17,7 @@ pub const DELETE_CONFIGURATION: &str = "CMD_DELETE_CONFIGURATION"; // extra: Con
 pub const RESTART_ROBOT: &str = "CMD_RESTART_ROBOT";
 pub const SCAN: &str = "CMD_SCAN";
 pub const DISCOVER_LYNX_MODULES: &str = "CMD_DISCOVER_LYNX_MODULES";
+pub const REQUEST_FRAME: &str = "CMD_REQUEST_FRAME"; // no-op if no webcam registered
 
 // RC -> DS notifications/responses.
 pub const NOTIFY_OP_MODE_LIST: &str = "CMD_NOTIFY_OP_MODE_LIST"; // extra: OpMode[] JSON
@@ -29,6 +30,28 @@ pub const REQUEST_PARTICULAR_CONFIGURATION_RESP: &str = "CMD_REQUEST_PARTICULAR_
 pub const SCAN_RESP: &str = "CMD_SCAN_RESP";
 pub const DISCOVER_LYNX_MODULES_RESP: &str = "CMD_DISCOVER_LYNX_MODULES_RESP";
 pub const SHOW_STACKTRACE: &str = "CMD_SHOW_STACKTRACE"; // extra: stacktrace text
+pub const STREAM_CHANGE: &str = "CMD_STREAM_CHANGE"; // extra: literal "true"/"false", not JSON
+pub const RECEIVE_FRAME_BEGIN: &str = "CMD_RECEIVE_FRAME_BEGIN"; // extra: FrameBegin JSON
+pub const RECEIVE_FRAME_CHUNK: &str = "CMD_RECEIVE_FRAME_CHUNK"; // extra: FrameChunk JSON
+
+pub const FRAME_CHUNK_SIZE: usize = 4096;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameBegin {
+    #[serde(rename = "frameNum")]
+    pub frame_num: i32,
+    pub length: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameChunk {
+    #[serde(rename = "frameNum")]
+    pub frame_num: i32,
+    #[serde(rename = "chunkNum")]
+    pub chunk_num: i32,
+    #[serde(rename = "encodedData")]
+    pub encoded_data: String,
+}
 
 /// The SDK's built-in idle OpMode (OpModeManager.DEFAULT_OP_MODE_NAME).
 /// The stock DS "stops" a running OpMode by initing this one.
