@@ -26,7 +26,8 @@ use std::time::{Duration, Instant};
 use jpeg_encoder::{ColorType, Encoder};
 use robocol::cmd::{self, ConfigMeta};
 use robocol::packets::{
-    Command, Packet, PeerDiscovery, Telemetry, BATTERY_LEVEL_KEY, SYSTEM_KEY_PREFIX,
+    Command, Packet, PeerDiscovery, Telemetry, BATTERY_LEVEL_KEY, RC_BATTERY_STATUS_KEY,
+    SYSTEM_KEY_PREFIX,
 };
 use robocol::types::RobotState;
 use robocol::ROBOCOL_PORT;
@@ -39,8 +40,19 @@ const CAM_FRAME_INTERVAL: Duration = Duration::from_millis(83);
 const OPMODES: &str = r#"[
     {"name":"Duo (TeleOp)","flavor":"TELEOP","group":"drive"},
     {"name":"Solo (TeleOp)","flavor":"TELEOP","group":"drive"},
-    {"name":"Auto: Sand Run","flavor":"AUTONOMOUS","group":"auto"}
+    {"name":"Auto: Sand Run","flavor":"AUTONOMOUS","group":"auto"},
+    {"name":"Crash Test","flavor":"TELEOP","group":"debug"}
 ]"#;
+
+/// Throws CRASH_DELAY after START, the way a real OpMode dies mid-loop.
+const CRASH_OPMODE: &str = "Crash Test";
+const CRASH_DELAY: Duration = Duration::from_secs(2);
+const CRASH_STACKTRACE: &str = "java.lang.NullPointerException: Attempt to invoke virtual method \
+'void com.qualcomm.robotcore.hardware.DcMotor.setPower(double)' on a null object reference\n\
+\tat org.firstinspires.ftc.teamcode.CrashTest.loop(CrashTest.java:42)\n\
+\tat com.qualcomm.robotcore.eventloop.opmode.OpModeManagerImpl.runActiveOpMode\
+(OpModeManagerImpl.java:475)\n\
+\tat com.qualcomm.robotcore.eventloop.opmode.FtcEventLoop.loop(FtcEventLoop.java:180)";
 
 /// Canned device XML served for CMD_REQUEST_PARTICULAR_CONFIGURATION unless a
 /// config has been saved (see `saved_xml`). The RC sends raw device XML here,
@@ -104,6 +116,7 @@ struct FakeRc {
     left_stick_y: f32,
     seq: u16,
     started: Instant,
+    run_started: Option<Instant>,
     configs: Vec<ConfigMeta>,
     active_config: ConfigMeta,
     /// Device XML saved per config name, served back on a particular-config
@@ -148,6 +161,7 @@ impl FakeRc {
         match command.name.as_str() {
             cmd::REQUEST_OP_MODE_LIST => self.send_command(cmd::NOTIFY_OP_MODE_LIST, OPMODES),
             cmd::INIT_OP_MODE => {
+                self.run_started = None;
                 if command.extra == cmd::DEFAULT_OP_MODE {
                     self.state = RobotState::Stopped;
                     self.opmode.clear();
@@ -162,6 +176,7 @@ impl FakeRc {
             cmd::RUN_OP_MODE => {
                 self.state = RobotState::Running;
                 self.opmode = command.extra.clone();
+                self.run_started = Some(Instant::now());
                 self.send_command(cmd::NOTIFY_RUN_OP_MODE, &command.extra);
             }
             cmd::RESTART_ROBOT => {
@@ -318,6 +333,39 @@ impl FakeRc {
         }
         let bytes = t.serialize();
         self.send(&bytes);
+    }
+
+    /// The RC's own battery status: its own packet, tagged with the reserved
+    /// key it carries, `"<percent>|<isCharging>"` (real-capture shape).
+    fn rc_battery_tick(&mut self) {
+        let t = Telemetry {
+            seq: self.next_seq(),
+            timestamp: self.started.elapsed().as_nanos() as i64,
+            is_sorted: true,
+            robot_state: self.state,
+            tag: RC_BATTERY_STATUS_KEY.to_string(),
+            strings: vec![(RC_BATTERY_STATUS_KEY.into(), "100.0|true".into())],
+            numbers: BTreeMap::new(),
+        };
+        let bytes = t.serialize();
+        self.send(&bytes);
+    }
+
+    /// A crashing OpMode reports the exception and is torn down by the RC in
+    /// the same breath — the DS gets no chance to ask why afterwards.
+    fn crash_tick(&mut self) {
+        if self.opmode != CRASH_OPMODE || self.state != RobotState::Running {
+            return;
+        }
+        if self.run_started.is_none_or(|t| t.elapsed() < CRASH_DELAY) {
+            return;
+        }
+        self.run_started = None;
+        self.send_command(cmd::SHOW_STACKTRACE, CRASH_STACKTRACE);
+        self.state = RobotState::Stopped;
+        self.opmode.clear();
+        self.set_webcam_available(false);
+        self.send_command(cmd::NOTIFY_INIT_OP_MODE, cmd::DEFAULT_OP_MODE);
     }
 }
 
@@ -498,6 +546,7 @@ fn main() {
         left_stick_y: 0.0,
         seq: 0,
         started: Instant::now(),
+        run_started: None,
         configs: vec![
             ConfigMeta {
                 is_dirty: false,
@@ -528,6 +577,7 @@ fn main() {
 
     let mut buf = [0u8; 4096];
     let mut last_telemetry = Instant::now();
+    let mut last_rc_battery = Instant::now();
     loop {
         match rc.socket.recv_from(&mut buf) {
             Ok((n, from)) => match Packet::parse(&buf[..n]) {
@@ -581,9 +631,16 @@ fn main() {
             Err(e) => println!("!! socket error: {e}"),
         }
 
+        rc.crash_tick();
+
         if last_telemetry.elapsed() >= Duration::from_millis(100) {
             last_telemetry = Instant::now();
             rc.telemetry_tick();
+        }
+
+        if last_rc_battery.elapsed() >= Duration::from_secs(1) {
+            last_rc_battery = Instant::now();
+            rc.rc_battery_tick();
         }
     }
 }

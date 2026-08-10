@@ -21,6 +21,10 @@ const NO_VOLTAGE_SENSOR: &str = "$no$voltage$sensor$";
 /// Robot Controller raises itself, independent of any OpMode (lost Expansion
 /// Hub, low battery, and the like).
 pub const SYSTEM_KEY_PREFIX: &str = "$System$";
+/// Reserved key for the RC device's own battery status, sent under a tag of
+/// the same name with a `"<percent>|<isCharging>"` value (e.g. `100.0|true`).
+/// Distinct from `BATTERY_LEVEL_KEY`, which is the *robot* battery's voltage.
+pub const RC_BATTERY_STATUS_KEY: &str = "$RobotController$Battery$Status$";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Telemetry {
