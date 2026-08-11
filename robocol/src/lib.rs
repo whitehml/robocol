@@ -41,14 +41,13 @@
     clippy::duration_suboptimal_units
 )]
 
-mod wire;
-
 pub mod base64;
 pub mod client;
 pub mod cmd;
 pub mod packets;
 pub mod types;
 pub mod video;
+pub mod wire;
 
 pub use client::{ClientConfig, Event, RobocolClient};
 pub use packets::Packet;
