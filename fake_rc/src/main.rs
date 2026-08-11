@@ -38,10 +38,14 @@ const CAM_HEIGHT: u16 = 240;
 const CAM_FRAME_INTERVAL: Duration = Duration::from_millis(83);
 
 const OPMODES: &str = r#"[
-    {"name":"Duo (TeleOp)","flavor":"TELEOP","group":"drive"},
-    {"name":"Solo (TeleOp)","flavor":"TELEOP","group":"drive"},
-    {"name":"Auto: Sand Run","flavor":"AUTONOMOUS","group":"auto"},
-    {"name":"Crash Test","flavor":"TELEOP","group":"debug"}
+    {"name":"$Stop$Robot$","flavor":"SYSTEM","group":"$$$$$$$","source":"BUILTIN","description":"","systemOpModeBaseDisplayName":"Stop Robot"},
+    {"name":"$Configure$Robot$","flavor":"SYSTEM","group":"$$$$$$$","source":"BUILTIN","description":"","systemOpModeBaseDisplayName":"Configure Robot"},
+    {"name":"Test Hardware (Built-in)","flavor":"UTILITY","group":"$$$$$$$","source":"BUILTIN","description":"Exercise each configured motor and servo","systemOpModeBaseDisplayName":"Test Hardware"},
+    {"name":"Test Gamepad (Built-in)","flavor":"UTILITY","group":"$$$$$$$","source":"BUILTIN","description":"Show live gamepad input","systemOpModeBaseDisplayName":"Test Gamepad"},
+    {"name":"Duo (TeleOp)","flavor":"TELEOP","group":"drive","source":"ANDROID_STUDIO","description":""},
+    {"name":"Solo (TeleOp)","flavor":"TELEOP","group":"drive","source":"ANDROID_STUDIO","description":""},
+    {"name":"Auto: Sand Run","flavor":"AUTONOMOUS","group":"auto","source":"ANDROID_STUDIO","description":""},
+    {"name":"Crash Test","flavor":"TELEOP","group":"$$$$$$$","source":"ANDROID_STUDIO","description":""}
 ]"#;
 
 /// Throws CRASH_DELAY after START, the way a real OpMode dies mid-loop.
