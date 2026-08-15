@@ -330,6 +330,10 @@ impl FakeRc {
                 t.numbers
                     .insert("drive_power".into(), 0.5 + 0.5 * (elapsed * 0.7).sin());
                 t.numbers.insert("left_stick_y".into(), self.left_stick_y);
+                t.push_line(format!(
+                    "Servo Bus Current : {:.2} A",
+                    1.6 + 0.8 * (elapsed * 1.3).sin()
+                ));
             }
             // Other states still report battery voltage, like a real hub's
             // idle telemetry — just no OpMode-specific keys.
