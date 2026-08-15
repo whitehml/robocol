@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -399,15 +399,15 @@ impl Worker {
     }
 
     fn handle_datagram(&mut self, data: &[u8], from: SocketAddr) -> bool {
-        if let Some(peer) = self.peer {
-            if peer != from {
-                return self
-                    .events
-                    .send(Event::ProtocolError(format!(
-                        "ignored packet from {from}: connected peer is {peer}"
-                    )))
-                    .is_ok();
-            }
+        if let Some(peer) = self.peer
+            && peer != from
+        {
+            return self
+                .events
+                .send(Event::ProtocolError(format!(
+                    "ignored packet from {from}: connected peer is {peer}"
+                )))
+                .is_ok();
         }
         self.last_rx = Instant::now();
 
@@ -417,7 +417,7 @@ impl Worker {
                 return self
                     .events
                     .send(Event::ProtocolError(e.to_string()))
-                    .is_ok()
+                    .is_ok();
             }
         };
 

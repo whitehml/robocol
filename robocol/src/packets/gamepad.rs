@@ -2,7 +2,7 @@
 //!
 //! `user` (offset 46) selects: 1 = gamepad1, 2 = gamepad2.
 
-use crate::types::{GamepadType, GAMEPAD_ID_SYNTHETIC};
+use crate::types::{GAMEPAD_ID_SYNTHETIC, GamepadType};
 use crate::wire::{self, Result};
 
 #[derive(Debug, Clone, PartialEq)]

@@ -13,7 +13,7 @@ pub use gamepad::Gamepad;
 pub use heartbeat::Heartbeat;
 pub use keep_alive::KeepAlive;
 pub use peer_discovery::{PeerDiscovery, PeerType};
-pub use telemetry::{Telemetry, BATTERY_LEVEL_KEY, RC_BATTERY_STATUS_KEY, SYSTEM_KEY_PREFIX};
+pub use telemetry::{BATTERY_LEVEL_KEY, RC_BATTERY_STATUS_KEY, SYSTEM_KEY_PREFIX, Telemetry};
 
 use crate::wire::{Error, Result};
 

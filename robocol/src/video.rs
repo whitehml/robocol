@@ -6,9 +6,9 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -222,12 +222,11 @@ fn read_response_head<R: BufRead>(
         if debug {
             eprintln!("video[{source}]: | {line}");
         }
-        if let Some((name, value)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("transfer-encoding")
-                && value.to_ascii_lowercase().contains("chunked")
-            {
-                chunked = true;
-            }
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("transfer-encoding")
+            && value.to_ascii_lowercase().contains("chunked")
+        {
+            chunked = true;
         }
         if let Some(b) = parse_boundary(&line) {
             boundary = Some(b);
@@ -326,10 +325,10 @@ fn skip_part_headers<R: BufRead>(reader: &mut R) -> std::io::Result<Option<usize
         if line.is_empty() {
             return Ok(content_length);
         }
-        if let Some((name, value)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("content-length") {
-                content_length = value.trim().parse::<usize>().ok();
-            }
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse::<usize>().ok();
         }
     }
 }

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use robocol::client::{ClientConfig, Event, RobocolClient};
 use robocol::cmd::{self, ConfigMeta};
-use robocol::packets::{Command, Packet, PeerDiscovery, Telemetry, BATTERY_LEVEL_KEY};
+use robocol::packets::{BATTERY_LEVEL_KEY, Command, Packet, PeerDiscovery, Telemetry};
 use robocol::types::RobotState;
 
 fn wait_for<T>(rx: &Receiver<Event>, mut pick: impl FnMut(Event) -> Option<T>) -> T {
@@ -105,12 +105,12 @@ fn full_handshake_and_traffic() {
     // Client must have acked our notify.
     loop {
         let (n, _) = rc.recv_from(&mut buf).unwrap();
-        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n]) {
-            if c.acknowledged {
-                assert_eq!(c.name, cmd::NOTIFY_OP_MODE_LIST);
-                assert_eq!(c.timestamp, 777);
-                break;
-            }
+        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n])
+            && c.acknowledged
+        {
+            assert_eq!(c.name, cmd::NOTIFY_OP_MODE_LIST);
+            assert_eq!(c.timestamp, 777);
+            break;
         }
     }
 
@@ -138,11 +138,12 @@ fn full_handshake_and_traffic() {
     client.init_opmode("Duo");
     loop {
         let (n, _) = rc.recv_from(&mut buf).unwrap();
-        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n]) {
-            if !c.acknowledged && c.name == cmd::INIT_OP_MODE {
-                assert_eq!(c.extra, "Duo");
-                break;
-            }
+        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n])
+            && !c.acknowledged
+            && c.name == cmd::INIT_OP_MODE
+        {
+            assert_eq!(c.extra, "Duo");
+            break;
         }
     }
 
@@ -188,10 +189,11 @@ fn activate_configuration_round_trips_meta_and_triggers_restart() {
     // an activate/request/delete keyed by name alone).
     let activate = loop {
         let (n, _) = rc.recv_from(&mut buf).unwrap();
-        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n]) {
-            if !c.acknowledged && c.name == cmd::ACTIVATE_CONFIGURATION {
-                break c;
-            }
+        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n])
+            && !c.acknowledged
+            && c.name == cmd::ACTIVATE_CONFIGURATION
+        {
+            break c;
         }
     };
     let sent: ConfigMeta = serde_json::from_str(&activate.extra).unwrap();
@@ -204,10 +206,11 @@ fn activate_configuration_round_trips_meta_and_triggers_restart() {
     // automatically as soon as the activate is acked.
     loop {
         let (n, _) = rc.recv_from(&mut buf).unwrap();
-        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n]) {
-            if !c.acknowledged && c.name == cmd::RESTART_ROBOT {
-                break;
-            }
+        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n])
+            && !c.acknowledged
+            && c.name == cmd::RESTART_ROBOT
+        {
+            break;
         }
     }
 
@@ -244,10 +247,11 @@ fn save_configuration_does_not_restart_robot() {
 
     let save = loop {
         let (n, _) = rc.recv_from(&mut buf).unwrap();
-        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n]) {
-            if !c.acknowledged && c.name == cmd::SAVE_CONFIGURATION {
-                break c;
-            }
+        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n])
+            && !c.acknowledged
+            && c.name == cmd::SAVE_CONFIGURATION
+        {
+            break c;
         }
     };
     rc.send_to(&Command::ack_of(&save).serialize(), ds_addr)
@@ -277,20 +281,22 @@ fn save_configuration_does_not_restart_robot() {
     client.activate_configuration(&meta);
     let activate = loop {
         let (n, _) = rc.recv_from(&mut buf).unwrap();
-        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n]) {
-            if !c.acknowledged && c.name == cmd::ACTIVATE_CONFIGURATION {
-                break c;
-            }
+        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n])
+            && !c.acknowledged
+            && c.name == cmd::ACTIVATE_CONFIGURATION
+        {
+            break c;
         }
     };
     rc.send_to(&Command::ack_of(&activate).serialize(), ds_addr)
         .unwrap();
     loop {
         let (n, _) = rc.recv_from(&mut buf).unwrap();
-        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n]) {
-            if !c.acknowledged && c.name == cmd::RESTART_ROBOT {
-                break;
-            }
+        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n])
+            && !c.acknowledged
+            && c.name == cmd::RESTART_ROBOT
+        {
+            break;
         }
     }
 
@@ -316,12 +322,13 @@ fn webcam_frame_reassembles_from_chunks_and_chains_next_request() {
     // the stream is available.
     loop {
         let (n, _) = rc.recv_from(&mut buf).unwrap();
-        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n]) {
-            if !c.acknowledged && c.name == cmd::REQUEST_FRAME {
-                rc.send_to(&Command::ack_of(&c).serialize(), ds_addr)
-                    .unwrap();
-                break;
-            }
+        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n])
+            && !c.acknowledged
+            && c.name == cmd::REQUEST_FRAME
+        {
+            rc.send_to(&Command::ack_of(&c).serialize(), ds_addr)
+                .unwrap();
+            break;
         }
     }
 
@@ -369,10 +376,11 @@ fn webcam_frame_reassembles_from_chunks_and_chains_next_request() {
     // request, without needing an external poller.
     loop {
         let (n, _) = rc.recv_from(&mut buf).unwrap();
-        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n]) {
-            if !c.acknowledged && c.name == cmd::REQUEST_FRAME {
-                break;
-            }
+        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n])
+            && !c.acknowledged
+            && c.name == cmd::REQUEST_FRAME
+        {
+            break;
         }
     }
 
@@ -420,10 +428,11 @@ fn unacked_command_is_retransmitted() {
 
     let first_seq = loop {
         let (n, _) = rc.recv_from(&mut buf).unwrap();
-        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n]) {
-            if !c.acknowledged && c.name == cmd::INIT_OP_MODE {
-                break c.seq;
-            }
+        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n])
+            && !c.acknowledged
+            && c.name == cmd::INIT_OP_MODE
+        {
+            break c.seq;
         }
     };
 
@@ -431,11 +440,12 @@ fn unacked_command_is_retransmitted() {
     // once command_retry_interval elapses.
     loop {
         let (n, _) = rc.recv_from(&mut buf).unwrap();
-        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n]) {
-            if !c.acknowledged && c.name == cmd::INIT_OP_MODE {
-                assert_ne!(c.seq, first_seq);
-                break;
-            }
+        if let Ok(Packet::Command(c)) = Packet::parse(&buf[..n])
+            && !c.acknowledged
+            && c.name == cmd::INIT_OP_MODE
+        {
+            assert_ne!(c.seq, first_seq);
+            break;
         }
     }
 

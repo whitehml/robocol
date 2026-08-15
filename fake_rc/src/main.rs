@@ -24,13 +24,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use jpeg_encoder::{ColorType, Encoder};
+use robocol::ROBOCOL_PORT;
 use robocol::cmd::{self, ConfigMeta};
 use robocol::packets::{
-    Command, Packet, PeerDiscovery, Telemetry, BATTERY_LEVEL_KEY, RC_BATTERY_STATUS_KEY,
-    SYSTEM_KEY_PREFIX,
+    BATTERY_LEVEL_KEY, Command, Packet, PeerDiscovery, RC_BATTERY_STATUS_KEY, SYSTEM_KEY_PREFIX,
+    Telemetry,
 };
 use robocol::types::RobotState;
-use robocol::ROBOCOL_PORT;
 
 const LIMELIGHT_PORT: u16 = 5800;
 const CAM_WIDTH: u16 = 320;

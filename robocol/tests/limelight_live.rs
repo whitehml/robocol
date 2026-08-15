@@ -11,12 +11,12 @@
 //!     cargo test -p robocol --test limelight_live -- --ignored
 //! ```
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::Duration;
 
-use robocol::video::{run_stream, StreamConfig, VideoEvent};
+use robocol::video::{StreamConfig, VideoEvent, run_stream};
 
 #[test]
 #[ignore = "needs a real Limelight on the network; set DECK_LIMELIGHT_STREAM and pass --ignored"]
