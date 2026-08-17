@@ -85,28 +85,35 @@ const FAKE_CONFIG_XML: &str = r#"<?xml version='1.0' encoding='UTF-8' standalone
 
 /// Canned CMD_SCAN_RESP: a scanned hardware tree that includes an
 /// EthernetDevice.
-const SCAN_XML: &str = r#"<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
-<Robot type="FirstInspires-FTC">
-    <LynxUsbDevice name="Control Hub Portal" serialNumber="(embedded)" parentModuleAddress="173">
-        <LynxModule name="Control Hub" port="173" />
-    </LynxUsbDevice>
-    <EthernetDevice name="Ethernet Device" serialNumber="EthernetOverUsb:eth0:172.29.0.24" port="-1" ipAddress="172.29.0.1" />
-    <Webcam name="Webcam 1" serialNumber="0x00012345" />
-</Robot>"#;
+/// Canned CMD_SCAN_RESP. A scan reports attached *USB* devices only — serial
+/// number and coarse type — never config XML. Shape is
+/// `ScannedDevices.toSerializationString()`: a GSON dump of
+/// `Map<SerialNumber, DeviceManager.UsbDeviceType>` in the complex-key entry
+/// form, with `errorMessage` omitted while null. Verified by running RobotCore
+/// 11.2.1 against the gson 2.8.0 it bundles.
+const SCAN_RESP: &str = concat!(
+    r#"{"map":[{"key":"(embedded)","value":"LYNX_USB_DEVICE"},"#,
+    r#"{"key":"3E425A6F","value":"WEBCAM"},"#,
+    r#"{"key":"EthernetOverUsb:eth0:172.29.0.24","value":"ETHERNET_DEVICE"}]}"#
+);
 
-/// Canned CMD_NOTIFY_USER_DEVICE_LIST: the RC's supported device-type
-/// descriptors, nested-array shaped like real hardware. `deviceFlavor`
-/// categorizes the Add-device picker (motor / servo / i2c).
-const USER_DEVICE_TYPES: &str = r#"[[
-    {"xmlTag":"goBILDA5202SeriesMotor","name":"goBILDA 5202/3/4 series","deviceFlavor":"MOTOR","flavor":"BUILT_IN"},
-    {"xmlTag":"RevRoboticsCoreHexMotor","name":"REV Core Hex Motor","deviceFlavor":"MOTOR","flavor":"BUILT_IN"},
-    {"xmlTag":"RevRobotics20HDHexMotor","name":"REV HD Hex Motor 20:1","deviceFlavor":"MOTOR","flavor":"BUILT_IN"},
-    {"xmlTag":"Servo","name":"Servo","deviceFlavor":"SERVO","flavor":"BUILT_IN"},
-    {"xmlTag":"ContinuousRotationServo","name":"Continuous Rotation Servo","deviceFlavor":"SERVO","flavor":"BUILT_IN"},
-    {"xmlTag":"ControlHubImuBHI260AP","name":"Control Hub IMU (BHI260AP)","deviceFlavor":"I2C","flavor":"BUILT_IN"},
-    {"xmlTag":"REV_VL53L0X_RANGE_SENSOR","name":"REV 2M Distance Sensor","deviceFlavor":"I2C","flavor":"BUILT_IN"},
-    {"xmlTag":"SparkFunOTOS","name":"SparkFun OTOS","deviceFlavor":"I2C","flavor":"BUILT_IN"}
-]]"#;
+/// Canned CMD_NOTIFY_USER_DEVICE_LIST. Shape matches the RC's own
+/// `ConfigurationTypeManager.serializeUserDeviceTypes()`: a flat GSON array
+/// whose `flavor` doubles as the RuntimeTypeAdapterFactory type label, so
+/// annotation-registered types carry their real DeviceFlavor while
+/// BuiltInConfigurationType members collapse to {xmlTag, name, "BUILT_IN"}.
+const USER_DEVICE_TYPES: &str = r#"[
+    {"name":"goBILDA 5202/3/4 series","flavor":"MOTOR","xmlTag":"goBILDA5202SeriesMotor","builtIn":true,"isDeprecated":false,"classSource":"APK"},
+    {"name":"REV Core Hex Motor","flavor":"MOTOR","xmlTag":"RevRoboticsCoreHexMotor","builtIn":true,"isDeprecated":false,"classSource":"APK"},
+    {"name":"REV HD Hex Motor 20:1","flavor":"MOTOR","xmlTag":"RevRobotics20HDHexMotor","builtIn":true,"isDeprecated":false,"classSource":"APK"},
+    {"name":"Servo","flavor":"SERVO","xmlTag":"Servo","builtIn":true,"isDeprecated":false,"classSource":"APK"},
+    {"name":"Continuous Rotation Servo","flavor":"SERVO","xmlTag":"ContinuousRotationServo","builtIn":true,"isDeprecated":false,"classSource":"APK"},
+    {"name":"Control Hub IMU (BHI260AP)","flavor":"I2C","xmlTag":"ControlHubImuBHI260AP","builtIn":true,"isDeprecated":false,"classSource":"APK"},
+    {"name":"REV 2M Distance Sensor","flavor":"I2C","xmlTag":"REV_VL53L0X_RANGE_SENSOR","builtIn":true,"isDeprecated":false,"classSource":"APK"},
+    {"name":"SparkFun OTOS","flavor":"I2C","xmlTag":"SparkFunOTOS","builtIn":false,"isDeprecated":false,"classSource":"APK"},
+    {"xmlTag":"LynxColorSensor","name":"REV Color/Range Sensor","flavor":"BUILT_IN"},
+    {"xmlTag":"Webcam","name":"Webcam","flavor":"BUILT_IN"}
+]"#;
 
 struct FakeRc {
     socket: UdpSocket,
@@ -219,7 +226,7 @@ impl FakeRc {
                 self.send_command(cmd::NOTIFY_USER_DEVICE_LIST, USER_DEVICE_TYPES);
             }
             cmd::SCAN => {
-                self.send_command(cmd::SCAN_RESP, SCAN_XML);
+                self.send_command(cmd::SCAN_RESP, SCAN_RESP);
             }
             cmd::ACTIVATE_CONFIGURATION => {
                 if let Ok(meta) = serde_json::from_str::<ConfigMeta>(&command.extra) {
@@ -240,9 +247,17 @@ impl FakeRc {
                 }
                 self.saved_xml.insert(meta.name.clone(), xml.to_string());
                 match self.configs.iter_mut().find(|c| c.name == meta.name) {
-                    Some(existing) => *existing = meta,
-                    None => self.configs.push(meta),
+                    Some(existing) => *existing = meta.clone(),
+                    None => self.configs.push(meta.clone()),
                 }
+                // The RC's handleCommandSaveConfiguration calls
+                // setActiveConfigAndUpdateUI, so a save moves the active
+                // pointer without restarting the robot.
+                self.active_config = meta.clone();
+                self.send_command(
+                    cmd::NOTIFY_ACTIVE_CONFIGURATION,
+                    &serde_json::to_string(&meta).unwrap(),
+                );
             }
             cmd::DELETE_CONFIGURATION => {
                 if let Ok(meta) = serde_json::from_str::<ConfigMeta>(&command.extra) {
@@ -334,6 +349,7 @@ impl FakeRc {
                     "Servo Bus Current : {:.2} A",
                     1.6 + 0.8 * (elapsed * 1.3).sin()
                 ));
+                push_field_demo(&mut t, elapsed);
             }
             // Other states still report battery voltage, like a real hub's
             // idle telemetry — just no OpMode-specific keys.
@@ -374,6 +390,31 @@ impl FakeRc {
         self.opmode.clear();
         self.set_webcam_available(false);
         self.send_command(cmd::NOTIFY_INIT_OP_MODE, cmd::DEFAULT_OP_MODE);
+    }
+}
+
+/// Field-overlay demo lines, in the `#f` telemetry contract the Deck Driver
+/// Station's Field page parses. Coordinates are the default Pedro frame:
+/// 0,0 bottom-left to 144,144 top-right, in inches.
+fn push_field_demo(t: &mut Telemetry, elapsed: f32) {
+    let angle = elapsed * 0.4;
+    let (x, y) = (72.0 + 40.0 * angle.cos(), 72.0 + 40.0 * angle.sin());
+    let heading = angle.to_degrees() % 360.0;
+    let (dx, dy) = (-18.0 * angle.sin(), 18.0 * angle.cos());
+    t.push_line(format!("#f robot Robot x={x:.1} y={y:.1} h={heading:.1}"));
+    t.push_line("#f zone Launch pts=0,0;48,0;48,24;0,24");
+    t.push_line("#f zone Depot pts=96,120;144,120;144,144;96,144");
+    t.push_line(format!(
+        "#f vec Velocity x={x:.1} y={y:.1} dx={dx:.1} dy={dy:.1} unit=in/s"
+    ));
+    for i in 0..4 {
+        let phase = elapsed * 0.3 + i as f32 * 1.6;
+        t.push_line(format!(
+            "#f point \"Game Pieces\" x={:.1} y={:.1} h={:.1}",
+            72.0 + 55.0 * phase.cos(),
+            72.0 + 55.0 * (phase * 0.7).sin(),
+            phase.to_degrees() % 360.0
+        ));
     }
 }
 
