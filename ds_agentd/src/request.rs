@@ -16,7 +16,6 @@ use crate::waiters::{WaiterKind, WaiterRegistry};
 
 // Not yet constructed outside tests: Task 5's connection handling is what
 // will call `serde_json::from_str::<Request>` on incoming socket lines.
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "kebab-case")]
 pub enum Request {
@@ -104,17 +103,14 @@ pub enum Request {
 // The functions below are only reachable via `handle_request`, which is
 // itself only wired up to a real socket by Task 5 — allow dead_code until
 // then, as Tasks 2/3 did for `state`/`waiters`.
-#[allow(dead_code)]
 fn err(code: &str, message: impl Into<String>) -> serde_json::Value {
     serde_json::json!({"ok": false, "error": code, "message": message.into()})
 }
 
-#[allow(dead_code)]
 fn not_connected() -> serde_json::Value {
     err("not_connected", "robot controller not connected yet")
 }
 
-#[allow(dead_code)]
 fn check_known_opmode(state: &Arc<Mutex<DaemonState>>, name: &str) -> Option<serde_json::Value> {
     let state = state.lock().expect("state mutex poisoned");
     if state.opmodes.is_empty() || state.find_opmode(name) {
@@ -131,7 +127,6 @@ fn check_known_opmode(state: &Arc<Mutex<DaemonState>>, name: &str) -> Option<ser
 /// `robocol` request), and blocks up to `timeout` for the matching event.
 /// Fails fast with `not_connected` rather than waiting out the timeout when
 /// the daemon has never seen `Event::Connected`.
-#[allow(dead_code)]
 fn wait_for_event(
     waiters: &Arc<Mutex<WaiterRegistry>>,
     state: &Arc<Mutex<DaemonState>>,
@@ -199,7 +194,6 @@ fn build_gamepad(
     }
 }
 
-#[allow(dead_code)]
 pub fn handle_request(
     req: Request,
     client: &Arc<Mutex<RobocolClient>>,

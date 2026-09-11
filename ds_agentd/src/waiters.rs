@@ -8,7 +8,6 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use robocol::client::Event;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaiterKind {
     OpModeList,
@@ -22,7 +21,6 @@ pub enum WaiterKind {
     LynxModules,
 }
 
-#[allow(dead_code)]
 pub fn waiter_kind_of(event: &Event) -> Option<WaiterKind> {
     match event {
         Event::OpModeList(_) => Some(WaiterKind::OpModeList),
@@ -38,12 +36,10 @@ pub fn waiter_kind_of(event: &Event) -> Option<WaiterKind> {
     }
 }
 
-#[allow(dead_code)]
 pub struct WaiterRegistry {
     waiters: Vec<(WaiterKind, Sender<Event>)>,
 }
 
-#[allow(dead_code)]
 impl WaiterRegistry {
     pub fn new() -> Self {
         WaiterRegistry {
@@ -75,12 +71,10 @@ impl WaiterRegistry {
     }
 }
 
-#[allow(dead_code)]
 pub struct Subscribers {
     list: Vec<Sender<Event>>,
 }
 
-#[allow(dead_code)]
 impl Subscribers {
     pub fn new() -> Self {
         Subscribers { list: Vec::new() }

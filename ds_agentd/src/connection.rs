@@ -16,7 +16,6 @@ use crate::waiters::{Subscribers, WaiterRegistry};
 // Not yet wired up outside tests: Task 6's accept loop is what will spawn a
 // thread per connection calling `handle_connection`, as Tasks 2-4 noted for
 // `state`/`waiters`/`request`.
-#[allow(dead_code)]
 fn event_type_name(event: &Event) -> Option<&'static str> {
     match event {
         Event::Connected { .. } => Some("connected"),
@@ -31,7 +30,6 @@ fn event_type_name(event: &Event) -> Option<&'static str> {
     }
 }
 
-#[allow(dead_code)]
 fn event_to_watch_json(event: &Event, types: Option<&[String]>) -> Option<serde_json::Value> {
     let kind = event_type_name(event)?;
     if let Some(types) = types
@@ -66,7 +64,6 @@ fn event_to_watch_json(event: &Event, types: Option<&[String]>) -> Option<serde_
     })
 }
 
-#[allow(dead_code)]
 fn run_watch(
     stream: &mut UnixStream,
     subscribers: &Arc<Mutex<Subscribers>>,
@@ -85,7 +82,6 @@ fn run_watch(
     }
 }
 
-#[allow(dead_code)]
 pub fn handle_connection(
     mut stream: UnixStream,
     client: Arc<Mutex<RobocolClient>>,

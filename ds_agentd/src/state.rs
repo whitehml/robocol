@@ -10,7 +10,6 @@ use robocol::cmd::{ConfigMeta, OpModeMeta, parse_config_list};
 use robocol::packets::Telemetry;
 use robocol::types::RobotState;
 
-#[allow(dead_code)]
 pub struct DaemonState {
     pub connected: bool,
     pub peer: Option<String>,
@@ -32,7 +31,6 @@ pub struct DaemonState {
     pub telemetry: HashMap<String, Telemetry>,
 }
 
-#[allow(dead_code)]
 impl DaemonState {
     pub fn new() -> Self {
         DaemonState {
