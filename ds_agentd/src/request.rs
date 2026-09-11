@@ -141,13 +141,20 @@ fn wait_for_event(
     timeout: Duration,
     send: impl FnOnce(),
 ) -> Result<Event, serde_json::Value> {
-    let rx = waiters
+    let (id, rx) = waiters
         .lock()
         .expect("waiters mutex poisoned")
         .register(kind, pred);
     send();
-    rx.recv_timeout(timeout)
-        .map_err(|_| err("timeout", "robot controller did not respond in time"))
+    rx.recv_timeout(timeout).map_err(|_| {
+        // A payload-matched waiter (`init Foo`) would otherwise linger until
+        // a matching event that may never arrive.
+        waiters
+            .lock()
+            .expect("waiters mutex poisoned")
+            .unregister(id);
+        err("timeout", "robot controller did not respond in time")
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -802,5 +809,29 @@ mod tests {
         );
         assert_eq!(reply["ok"], false);
         assert_eq!(reply["error"], "timeout");
+    }
+
+    #[test]
+    fn timed_out_init_waiter_is_unregistered() {
+        let (state, waiters) = deps();
+        let peer: SocketAddr = "127.0.0.1:20884".parse().unwrap();
+        state
+            .lock()
+            .unwrap()
+            .apply_event(&Event::Connected { peer });
+        let client = unreachable_client();
+        let reply = handle_request(
+            Request::Init {
+                name: "Never".into(),
+            },
+            &client,
+            &state,
+            &waiters,
+            Duration::from_millis(50),
+        );
+        assert_eq!(reply["error"], "timeout");
+        // A name-matched waiter would otherwise linger until an
+        // `OpModeInited("Never")` that may never arrive.
+        assert_eq!(waiters.lock().unwrap().len(), 0);
     }
 }

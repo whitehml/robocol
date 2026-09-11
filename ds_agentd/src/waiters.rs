@@ -45,21 +45,54 @@ pub fn waiter_kind_of(event: &Event) -> Option<WaiterKind> {
 /// or stale event of the right kind can't resolve the wrong request.
 pub type WaiterPredicate = Box<dyn Fn(&Event) -> bool + Send>;
 
+/// Handle returned by `register`, used to `unregister` a waiter that gave
+/// up (timed out) before its event arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaiterId(u64);
+
+struct Waiter {
+    id: WaiterId,
+    kind: WaiterKind,
+    pred: WaiterPredicate,
+    tx: Sender<Event>,
+}
+
 pub struct WaiterRegistry {
-    waiters: Vec<(WaiterKind, WaiterPredicate, Sender<Event>)>,
+    waiters: Vec<Waiter>,
+    next_id: u64,
 }
 
 impl WaiterRegistry {
     pub fn new() -> Self {
         WaiterRegistry {
             waiters: Vec::new(),
+            next_id: 0,
         }
     }
 
-    pub fn register(&mut self, kind: WaiterKind, pred: WaiterPredicate) -> Receiver<Event> {
+    pub fn register(
+        &mut self,
+        kind: WaiterKind,
+        pred: WaiterPredicate,
+    ) -> (WaiterId, Receiver<Event>) {
         let (tx, rx) = mpsc::channel();
-        self.waiters.push((kind, pred, tx));
-        rx
+        let id = WaiterId(self.next_id);
+        self.next_id += 1;
+        self.waiters.push(Waiter { id, kind, pred, tx });
+        (id, rx)
+    }
+
+    /// Forgets a waiter whose caller stopped waiting. A payload-matched
+    /// waiter (`init Foo`) is otherwise only removed by a later
+    /// `OpModeInited("Foo")`, which may never come, so timed-out callers
+    /// must unregister or the registry grows without bound.
+    pub fn unregister(&mut self, id: WaiterId) {
+        self.waiters.retain(|w| w.id != id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.waiters.len()
     }
 
     /// Delivers `event` to every waiter registered for its kind whose
@@ -70,9 +103,9 @@ impl WaiterRegistry {
         let Some(kind) = waiter_kind_of(event) else {
             return;
         };
-        self.waiters.retain(|(k, pred, tx)| {
-            if *k == kind && pred(event) {
-                let _ = tx.send(event.clone());
+        self.waiters.retain(|w| {
+            if w.kind == kind && (w.pred)(event) {
+                let _ = w.tx.send(event.clone());
                 false
             } else {
                 true
@@ -123,8 +156,8 @@ mod tests {
     #[test]
     fn resolve_delivers_to_matching_kind_only() {
         let mut registry = WaiterRegistry::new();
-        let opmode_rx = registry.register(WaiterKind::OpModeList, any());
-        let config_rx = registry.register(WaiterKind::ActiveConfiguration, any());
+        let (_, opmode_rx) = registry.register(WaiterKind::OpModeList, any());
+        let (_, config_rx) = registry.register(WaiterKind::ActiveConfiguration, any());
 
         registry.resolve(&Event::OpModeList(vec![]));
 
@@ -135,7 +168,7 @@ mod tests {
     #[test]
     fn resolve_forgets_waiter_after_one_delivery() {
         let mut registry = WaiterRegistry::new();
-        let rx = registry.register(WaiterKind::ScanResult, any());
+        let (_, rx) = registry.register(WaiterKind::ScanResult, any());
 
         registry.resolve(&Event::ScanResult("first".into()));
         registry.resolve(&Event::ScanResult("second".into()));
@@ -147,7 +180,7 @@ mod tests {
     #[test]
     fn resolve_ignores_events_with_no_waiter_kind() {
         let mut registry = WaiterRegistry::new();
-        let rx = registry.register(WaiterKind::OpModeList, any());
+        let (_, rx) = registry.register(WaiterKind::OpModeList, any());
         registry.resolve(&Event::Disconnected);
         assert!(rx.try_recv().is_err());
     }
@@ -155,12 +188,12 @@ mod tests {
     #[test]
     fn dropped_receiver_is_pruned_on_next_matching_event() {
         let mut registry = WaiterRegistry::new();
-        drop(registry.register(WaiterKind::ScanResult, any()));
+        drop(registry.register(WaiterKind::ScanResult, any()).1);
         // Resolving with a dropped receiver must not panic, and the dead
         // entry must be gone afterward (checked indirectly: a second
         // resolve with a fresh waiter only sees its own event).
         registry.resolve(&Event::ScanResult("ignored".into()));
-        let rx = registry.register(WaiterKind::ScanResult, any());
+        let (_, rx) = registry.register(WaiterKind::ScanResult, any());
         registry.resolve(&Event::ScanResult("seen".into()));
         assert_eq!(rx.try_recv().unwrap(), Event::ScanResult("seen".into()));
     }
@@ -168,7 +201,7 @@ mod tests {
     #[test]
     fn predicate_rejects_same_kind_event_with_other_payload() {
         let mut registry = WaiterRegistry::new();
-        let rx = registry.register(
+        let (_, rx) = registry.register(
             WaiterKind::OpModeInited,
             Box::new(|e| matches!(e, Event::OpModeInited(n) if n == "Foo")),
         );
@@ -176,11 +209,32 @@ mod tests {
         // The RC's unsolicited "$Stop$Robot$" must not resolve an `init Foo`.
         registry.resolve(&Event::OpModeInited("$Stop$Robot$".into()));
         assert!(rx.try_recv().is_err());
-        assert_eq!(registry.waiters.len(), 1);
+        assert_eq!(registry.len(), 1);
 
         registry.resolve(&Event::OpModeInited("Foo".into()));
         assert_eq!(rx.try_recv().unwrap(), Event::OpModeInited("Foo".into()));
-        assert!(registry.waiters.is_empty());
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn unregister_forgets_only_the_given_waiter() {
+        let mut registry = WaiterRegistry::new();
+        let (timed_out, _rx1) = registry.register(
+            WaiterKind::OpModeInited,
+            Box::new(|e| matches!(e, Event::OpModeInited(n) if n == "Never")),
+        );
+        let (_, rx2) = registry.register(WaiterKind::OpModeInited, any());
+        assert_eq!(registry.len(), 2);
+
+        registry.unregister(timed_out);
+        assert_eq!(registry.len(), 1);
+
+        // Unregistering twice (or an unknown id) is a no-op; the survivor
+        // still resolves.
+        registry.unregister(timed_out);
+        registry.resolve(&Event::OpModeInited("Other".into()));
+        assert_eq!(rx2.try_recv().unwrap(), Event::OpModeInited("Other".into()));
+        assert_eq!(registry.len(), 0);
     }
 
     #[test]
