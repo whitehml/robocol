@@ -1,0 +1,10 @@
+[package]
+name = "ds_agent_ipc"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Shared socket-path and line-framing logic for ds_agentd/ds_agent"
+
+[dependencies]
+serde_json = "1"
+libc = "0.2"
