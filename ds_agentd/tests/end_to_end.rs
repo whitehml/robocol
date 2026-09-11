@@ -131,22 +131,27 @@ fn drives_an_opmode_and_watches_telemetry_against_fake_rc() {
     assert_eq!(stop["ok"], true);
 
     // Watch: fake_rc streams telemetry at 10 Hz, so a short-lived watch
-    // process should see at least one line before it's killed.
-    let mut watch = Command::new(bin_path("ds_agent"))
-        .args(["watch", "--types", "telemetry"])
-        .env("XDG_RUNTIME_DIR", &tmp)
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("start ds_agent watch");
-    let stdout = watch.stdout.take().expect("watch stdout");
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("read a telemetry line");
-    let event: serde_json::Value =
-        serde_json::from_str(line.trim_end()).expect("watch line is JSON");
-    assert_eq!(event["event"], "telemetry");
-    let _ = watch.kill();
-    let _ = watch.wait();
+    // process should see at least one line before it's killed. Scoped in a
+    // block so the ChildGuard drops (killing the watch) before `daemon
+    // stop` below, and so a panic on any of the asserts still kills it
+    // rather than leaking an orphan `ds_agent watch` process.
+    {
+        let mut watch = ChildGuard(
+            Command::new(bin_path("ds_agent"))
+                .args(["watch", "--types", "telemetry"])
+                .env("XDG_RUNTIME_DIR", &tmp)
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("start ds_agent watch"),
+        );
+        let stdout = watch.0.stdout.take().expect("watch stdout");
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read a telemetry line");
+        let event: serde_json::Value =
+            serde_json::from_str(line.trim_end()).expect("watch line is JSON");
+        assert_eq!(event["event"], "telemetry");
+    }
 
     // Explicit teardown via `daemon stop`, ahead of ChildGuard's Drop kill,
     // proves the shutdown command itself works.
