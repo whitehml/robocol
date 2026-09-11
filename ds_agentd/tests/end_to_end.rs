@@ -1,9 +1,14 @@
 //! Drives the full `ds_agent` -> `ds_agentd` -> `fake_rc` stack the way a
 //! human would drive `ds_cli` -> a real Control Hub, but scripted.
+//!
+//! The two tests here use different runtime dirs and UDP ports, so cargo may
+//! run them in parallel.
 
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 struct ChildGuard(Child);
@@ -22,30 +27,39 @@ fn workspace_root() -> PathBuf {
 }
 
 /// `cargo test -p ds_agentd` only builds this crate's own binaries, so build
-/// the two siblings the test drives before touching them.
-fn build_sibling_bins() {
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", "ds_agent", "-p", "fake_rc"])
+/// the sibling crates a test drives before touching them.
+fn build_bins(packages: &[&str]) {
+    let mut cmd = Command::new(env!("CARGO"));
+    cmd.arg("build");
+    for p in packages {
+        cmd.args(["-p", p]);
+    }
+    let status = cmd
         .current_dir(workspace_root())
         .status()
-        .expect("run cargo build for ds_agent/fake_rc");
-    assert!(status.success(), "building ds_agent/fake_rc failed");
+        .unwrap_or_else(|e| panic!("run cargo build for {packages:?}: {e}"));
+    assert!(status.success(), "building {packages:?} failed");
 }
 
 fn bin_path(name: &str) -> PathBuf {
     // CARGO_BIN_EXE_ds_agentd is set for this crate's own binary; sibling
-    // binaries built by build_sibling_bins() share the same target/debug
-    // dir, one level up from ds_agentd's own exe path.
+    // binaries built by build_bins() share the same target/debug dir, one
+    // level up from ds_agentd's own exe path.
     let mut path = PathBuf::from(env!("CARGO_BIN_EXE_ds_agentd"));
     path.pop();
     path.push(name);
     path
 }
 
-fn run_agent(socket_dir: &std::path::Path, args: &[&str]) -> serde_json::Value {
+fn run_agent_with_env(
+    socket_dir: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> serde_json::Value {
     let output = Command::new(bin_path("ds_agent"))
         .args(args)
         .env("XDG_RUNTIME_DIR", socket_dir)
+        .envs(env.iter().copied())
         .output()
         .expect("run ds_agent");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -57,11 +71,35 @@ fn run_agent(socket_dir: &std::path::Path, args: &[&str]) -> serde_json::Value {
     })
 }
 
+fn run_agent(socket_dir: &Path, args: &[&str]) -> serde_json::Value {
+    run_agent_with_env(socket_dir, args, &[])
+}
+
+fn tempdir(tag: &str) -> PathBuf {
+    let dir = PathBuf::from(format!("/tmp/ds_agent_e2e_{tag}{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp runtime dir");
+    dir
+}
+
+/// Polls `cond` every 50 ms until it holds or `limit` elapses.
+fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        if cond() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn drives_an_opmode_and_watches_telemetry_against_fake_rc() {
-    build_sibling_bins();
+    build_bins(&["ds_agent", "fake_rc"]);
 
-    let tmp = tempdir();
+    let tmp = tempdir("");
     let fake_rc_port: u16 = 20950;
 
     let mut fake_rc = ChildGuard(
@@ -93,26 +131,19 @@ fn drives_an_opmode_and_watches_telemetry_against_fake_rc() {
 
     // Wait for the daemon's socket to exist before sending anything.
     let socket_path = tmp.join("ds_agentd.sock");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !socket_path.exists() {
-        assert!(Instant::now() < deadline, "ds_agentd socket never appeared");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    assert!(
+        wait_until(Duration::from_secs(3), || socket_path.exists()),
+        "ds_agentd socket never appeared"
+    );
 
     // Wait for the daemon to actually connect to fake_rc (discovery + a
     // couple of heartbeats) before issuing commands that depend on it.
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let status = run_agent(&tmp, &["status"]);
-        if status["connected"] == true {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "ds_agentd never connected to fake_rc"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    assert!(
+        wait_until(Duration::from_secs(3), || run_agent(&tmp, &["status"])
+            ["connected"]
+            == true),
+        "ds_agentd never connected to fake_rc"
+    );
 
     let list = run_agent(&tmp, &["list"]);
     assert_eq!(list["ok"], true);
@@ -134,7 +165,9 @@ fn drives_an_opmode_and_watches_telemetry_against_fake_rc() {
     // process should see at least one line before it's killed. Scoped in a
     // block so the ChildGuard drops (killing the watch) before `daemon
     // stop` below, and so a panic on any of the asserts still kills it
-    // rather than leaking an orphan `ds_agent watch` process.
+    // rather than leaking an orphan `ds_agent watch` process. The blocking
+    // read lives on a helper thread so a silent daemon fails the test
+    // within 5 s instead of hanging it; the kill-on-drop EOFs that thread.
     {
         let mut watch = ChildGuard(
             Command::new(bin_path("ds_agent"))
@@ -145,27 +178,95 @@ fn drives_an_opmode_and_watches_telemetry_against_fake_rc() {
                 .expect("start ds_agent watch"),
         );
         let stdout = watch.0.stdout.take().expect("watch stdout");
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        reader.read_line(&mut line).expect("read a telemetry line");
+        let (tx, rx) = mpsc::channel::<std::io::Result<String>>();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            let _ = tx.send(reader.read_line(&mut line).map(|_| line));
+        });
+        let line = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("no telemetry line within 5s")
+            .expect("read a telemetry line");
         let event: serde_json::Value =
             serde_json::from_str(line.trim_end()).expect("watch line is JSON");
         assert_eq!(event["event"], "telemetry");
     }
 
     // Explicit teardown via `daemon stop`, ahead of ChildGuard's Drop kill,
-    // proves the shutdown command itself works.
+    // proves the shutdown command itself works — and that the daemon
+    // actually exits on it, not just acknowledges.
     let stopped = run_agent(&tmp, &["daemon", "stop"]);
     assert_eq!(stopped["ok"], true);
-    std::thread::sleep(Duration::from_millis(200));
-    let _ = daemon.0.try_wait();
+    assert!(
+        wait_until(Duration::from_secs(2), || matches!(
+            daemon.0.try_wait(),
+            Ok(Some(_))
+        )),
+        "daemon did not exit after `daemon stop`"
+    );
     let _ = fake_rc.0.kill();
 
     std::fs::remove_dir_all(&tmp).expect("clean up runtime dir");
 }
 
-fn tempdir() -> PathBuf {
-    let dir = PathBuf::from(format!("/tmp/ds_agent_e2e_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp runtime dir");
-    dir
+/// Tears down whatever `ds_agent` auto-spawned even if the test panics
+/// midway: the daemon is detached in its own process group, so nothing else
+/// would reap it.
+struct SpawnedDaemonGuard {
+    dir: PathBuf,
+    env: Vec<(&'static str, &'static str)>,
+}
+
+impl Drop for SpawnedDaemonGuard {
+    fn drop(&mut self) {
+        let _ = Command::new(bin_path("ds_agent"))
+            .args(["daemon", "stop"])
+            .env("XDG_RUNTIME_DIR", &self.dir)
+            .envs(self.env.iter().copied())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[test]
+fn auto_spawns_daemon_logs_it_and_stops_it() {
+    build_bins(&["ds_agent"]);
+
+    let tmp = tempdir("spawn_");
+    // Port 1: nothing answers, so no fake_rc is needed and nothing clashes
+    // with the other test (or a running Deck Station on 20884).
+    let env: Vec<(&str, &str)> = vec![(
+        "DS_AGENTD_ARGS",
+        "--peer 127.0.0.1 --peer-port 1 --bind-port 0",
+    )];
+    let guard = SpawnedDaemonGuard {
+        dir: tmp.clone(),
+        env: env.clone(),
+    };
+
+    // No daemon is running for this runtime dir, so this spawns one.
+    let status = run_agent_with_env(&tmp, &["status"], &env);
+    assert_eq!(status["ok"], true, "status reply: {status}");
+    assert_eq!(status["connected"], false);
+
+    let log = tmp.join("ds_agentd.log");
+    assert!(log.exists(), "spawned daemon's log {} missing", log.display());
+
+    let daemon_status = run_agent_with_env(&tmp, &["daemon", "status"], &env);
+    assert_eq!(daemon_status["running"], true);
+
+    let stopped = run_agent_with_env(&tmp, &["daemon", "stop"], &env);
+    assert_eq!(stopped["ok"], true, "daemon stop reply: {stopped}");
+
+    let socket = tmp.join("ds_agentd.sock");
+    assert!(
+        wait_until(Duration::from_secs(2), || UnixStream::connect(&socket).is_err()),
+        "ds_agentd still accepting connections after `daemon stop`"
+    );
+
+    drop(guard); // best-effort second stop is a no-op; removes the dir
+    assert!(!tmp.exists(), "runtime dir not removed");
 }
