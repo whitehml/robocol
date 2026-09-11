@@ -1,0 +1,15 @@
+[package]
+name = "ds_agentd"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Headless daemon holding one persistent robocol connection for ds_agent"
+
+[[bin]]
+name = "ds_agentd"
+path = "src/main.rs"
+
+[dependencies]
+robocol = { path = "../robocol" }
+ds_agent_ipc = { path = "../ds_agent_ipc" }
+serde_json = "1"
