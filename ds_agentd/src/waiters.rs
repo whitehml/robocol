@@ -219,7 +219,11 @@ mod tests {
         for _ in 0..(SUBSCRIBER_QUEUE + 10) {
             subs.broadcast(&Event::Disconnected);
         }
-        assert_eq!(subs.list.len(), 1, "full queue must not prune; dead one must");
+        assert_eq!(
+            subs.list.len(),
+            1,
+            "full queue must not prune; dead one must"
+        );
 
         // Exactly the queue depth got through; the excess was dropped.
         let mut received = 0;

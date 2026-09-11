@@ -51,11 +51,7 @@ fn bin_path(name: &str) -> PathBuf {
     path
 }
 
-fn run_agent_with_env(
-    socket_dir: &Path,
-    args: &[&str],
-    env: &[(&str, &str)],
-) -> serde_json::Value {
+fn run_agent_with_env(socket_dir: &Path, args: &[&str], env: &[(&str, &str)]) -> serde_json::Value {
     let output = Command::new(bin_path("ds_agent"))
         .args(args)
         .env("XDG_RUNTIME_DIR", socket_dir)
@@ -139,9 +135,10 @@ fn drives_an_opmode_and_watches_telemetry_against_fake_rc() {
     // Wait for the daemon to actually connect to fake_rc (discovery + a
     // couple of heartbeats) before issuing commands that depend on it.
     assert!(
-        wait_until(Duration::from_secs(3), || run_agent(&tmp, &["status"])
-            ["connected"]
-            == true),
+        wait_until(
+            Duration::from_secs(3),
+            || run_agent(&tmp, &["status"])["connected"] == true
+        ),
         "ds_agentd never connected to fake_rc"
     );
 
@@ -253,7 +250,11 @@ fn auto_spawns_daemon_logs_it_and_stops_it() {
     assert_eq!(status["connected"], false);
 
     let log = tmp.join("ds_agentd.log");
-    assert!(log.exists(), "spawned daemon's log {} missing", log.display());
+    assert!(
+        log.exists(),
+        "spawned daemon's log {} missing",
+        log.display()
+    );
 
     let daemon_status = run_agent_with_env(&tmp, &["daemon", "status"], &env);
     assert_eq!(daemon_status["running"], true);
@@ -263,7 +264,8 @@ fn auto_spawns_daemon_logs_it_and_stops_it() {
 
     let socket = tmp.join("ds_agentd.sock");
     assert!(
-        wait_until(Duration::from_secs(2), || UnixStream::connect(&socket).is_err()),
+        wait_until(Duration::from_secs(2), || UnixStream::connect(&socket)
+            .is_err()),
         "ds_agentd still accepting connections after `daemon stop`"
     );
 
