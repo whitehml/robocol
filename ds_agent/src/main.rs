@@ -161,6 +161,9 @@ fn build_watch_request(args: &[String]) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({"cmd": "watch", "types": types}))
 }
 
+/// Connects to the daemon, spawning it if needed. A spawned daemon's stdout
+/// and stderr are redirected to `ds_agentd.log` next to the socket, so a
+/// crash or panic during startup can be diagnosed after the fact.
 fn connect_or_spawn() -> Result<UnixStream, String> {
     let path = ds_agent_ipc::socket_path();
     if let Ok(stream) = UnixStream::connect(&path) {
@@ -168,12 +171,27 @@ fn connect_or_spawn() -> Result<UnixStream, String> {
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let daemon_path = exe.with_file_name("ds_agentd");
+    let log_path = path.with_file_name("ds_agentd.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("failed to open {}: {e}", log_path.display()))?;
+    let log_err = log
+        .try_clone()
+        .map_err(|e| format!("failed to open {}: {e}", log_path.display()))?;
     std::process::Command::new(&daemon_path)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(log_err))
         .spawn()
-        .map_err(|e| format!("failed to start {}: {e}", daemon_path.display()))?;
+        .map_err(|e| {
+            format!(
+                "failed to start {}: {e}; see {}",
+                daemon_path.display(),
+                log_path.display()
+            )
+        })?;
 
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -181,7 +199,10 @@ fn connect_or_spawn() -> Result<UnixStream, String> {
             return Ok(stream);
         }
         if Instant::now() >= deadline {
-            return Err("ds_agentd did not become ready in time".into());
+            return Err(format!(
+                "ds_agentd did not become ready in time; see {}",
+                log_path.display()
+            ));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -201,7 +222,10 @@ fn run_daemon_subcommand(args: &[String]) -> i32 {
                         0
                     }
                     _ => {
-                        println!(r#"{{"ok":false,"error":"daemon_unreachable"}}"#);
+                        let line = serde_json::json!({"ok": false, "error": "daemon_unreachable"})
+                            .to_string();
+                        println!("{line}");
+                        eprintln!("{line}");
                         1
                     }
                 }
@@ -250,7 +274,11 @@ fn main() {
     let mut stream = match connect_or_spawn() {
         Ok(s) => s,
         Err(msg) => {
-            println!(r#"{{"ok":false,"error":"daemon_unreachable","message":{msg:?}}}"#);
+            let line =
+                serde_json::json!({"ok": false, "error": "daemon_unreachable", "message": msg})
+                    .to_string();
+            println!("{line}");
+            eprintln!("{line}");
             std::process::exit(1);
         }
     };
