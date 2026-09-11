@@ -43,6 +43,7 @@ version = "0.1.0"
 dependencies = [
  "ds_agent_ipc",
  "robocol",
+ "serde",
  "serde_json",
 ]
 
