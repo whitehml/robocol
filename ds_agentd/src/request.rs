@@ -12,10 +12,8 @@ use robocol::packets::Gamepad;
 use serde::Deserialize;
 
 use crate::state::DaemonState;
-use crate::waiters::{WaiterKind, WaiterRegistry};
+use crate::waiters::{WaiterKind, WaiterPredicate, WaiterRegistry};
 
-// Not yet constructed outside tests: Task 5's connection handling is what
-// will call `serde_json::from_str::<Request>` on incoming socket lines.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "kebab-case")]
 pub enum Request {
@@ -100,15 +98,24 @@ pub enum Request {
     Shutdown,
 }
 
-// The functions below are only reachable via `handle_request`, which is
-// itself only wired up to a real socket by Task 5 — allow dead_code until
-// then, as Tasks 2/3 did for `state`/`waiters`.
 fn err(code: &str, message: impl Into<String>) -> serde_json::Value {
     serde_json::json!({"ok": false, "error": code, "message": message.into()})
 }
 
-fn not_connected() -> serde_json::Value {
-    err("not_connected", "robot controller not connected yet")
+/// Every command except `ping`/`status` fails fast with `not_connected`
+/// when the daemon has never seen `Event::Connected`, rather than waiting
+/// out a timeout or silently dropping a packet that has no peer to go to.
+fn ensure_connected(state: &Arc<Mutex<DaemonState>>) -> Result<(), serde_json::Value> {
+    if state.lock().expect("state mutex poisoned").connected {
+        Ok(())
+    } else {
+        Err(err("not_connected", "robot controller not connected yet"))
+    }
+}
+
+/// Predicate for commands whose response carries nothing to match on.
+fn any_event() -> WaiterPredicate {
+    Box::new(|_| true)
 }
 
 fn check_known_opmode(state: &Arc<Mutex<DaemonState>>, name: &str) -> Option<serde_json::Value> {
@@ -123,30 +130,27 @@ fn check_known_opmode(state: &Arc<Mutex<DaemonState>>, name: &str) -> Option<ser
     }
 }
 
-/// Registers a waiter, fires `send` (which must issue exactly one
-/// `robocol` request), and blocks up to `timeout` for the matching event.
-/// Fails fast with `not_connected` rather than waiting out the timeout when
-/// the daemon has never seen `Event::Connected`.
+/// Registers a waiter for `kind` events accepted by `pred`, fires `send`
+/// (which must issue exactly one `robocol` request), and blocks up to
+/// `timeout` for the matching event. Callers must have already passed
+/// `ensure_connected`.
 fn wait_for_event(
     waiters: &Arc<Mutex<WaiterRegistry>>,
-    state: &Arc<Mutex<DaemonState>>,
     kind: WaiterKind,
+    pred: WaiterPredicate,
     timeout: Duration,
     send: impl FnOnce(),
 ) -> Result<Event, serde_json::Value> {
-    if !state.lock().expect("state mutex poisoned").connected {
-        return Err(not_connected());
-    }
     let rx = waiters
         .lock()
         .expect("waiters mutex poisoned")
-        .register(kind);
+        .register(kind, pred);
     send();
     rx.recv_timeout(timeout)
         .map_err(|_| err("timeout", "robot controller did not respond in time"))
 }
 
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn build_gamepad(
     left_stick_x: Option<f32>,
     left_stick_y: Option<f32>,
@@ -201,17 +205,31 @@ pub fn handle_request(
     waiters: &Arc<Mutex<WaiterRegistry>>,
     timeout: Duration,
 ) -> serde_json::Value {
+    match &req {
+        Request::Ping | Request::Status => {}
+        _ => {
+            if let Err(e) = ensure_connected(state) {
+                return e;
+            }
+        }
+    }
     match req {
         Request::Ping => serde_json::json!({"ok": true}),
         Request::Status => state.lock().expect("state mutex poisoned").to_json(),
         Request::List => {
             let client = client.clone();
-            match wait_for_event(waiters, state, WaiterKind::OpModeList, timeout, move || {
-                client
-                    .lock()
-                    .expect("client mutex poisoned")
-                    .request_opmode_list();
-            }) {
+            match wait_for_event(
+                waiters,
+                WaiterKind::OpModeList,
+                any_event(),
+                timeout,
+                move || {
+                    client
+                        .lock()
+                        .expect("client mutex poisoned")
+                        .request_opmode_list();
+                },
+            ) {
                 Ok(Event::OpModeList(list)) => serde_json::json!({
                     "ok": true,
                     "opmodes": list.iter().map(|m| serde_json::json!({
@@ -230,10 +248,11 @@ pub fn handle_request(
             }
             let client = client.clone();
             let send_name = name.clone();
+            let want = name.clone();
             match wait_for_event(
                 waiters,
-                state,
                 WaiterKind::OpModeInited,
+                Box::new(move |e| matches!(e, Event::OpModeInited(n) if *n == want)),
                 timeout,
                 move || {
                     client
@@ -270,10 +289,11 @@ pub fn handle_request(
             }
             let client = client.clone();
             let send_name = name.clone();
+            let want = name.clone();
             match wait_for_event(
                 waiters,
-                state,
                 WaiterKind::OpModeRunning,
+                Box::new(move |e| matches!(e, Event::OpModeRunning(n) if *n == want)),
                 timeout,
                 move || {
                     client
@@ -304,8 +324,8 @@ pub fn handle_request(
             let client = client.clone();
             match wait_for_event(
                 waiters,
-                state,
                 WaiterKind::ActiveConfiguration,
+                any_event(),
                 timeout,
                 move || {
                     client
@@ -327,8 +347,8 @@ pub fn handle_request(
             let client = client.clone();
             match wait_for_event(
                 waiters,
-                state,
                 WaiterKind::ConfigurationList,
+                any_event(),
                 timeout,
                 move || {
                     client
@@ -360,8 +380,8 @@ pub fn handle_request(
             let client = client.clone();
             match wait_for_event(
                 waiters,
-                state,
                 WaiterKind::Configuration,
+                any_event(),
                 timeout,
                 move || {
                     client
@@ -422,8 +442,8 @@ pub fn handle_request(
             let client = client.clone();
             match wait_for_event(
                 waiters,
-                state,
                 WaiterKind::UserDeviceList,
+                any_event(),
                 timeout,
                 move || {
                     client
@@ -443,9 +463,15 @@ pub fn handle_request(
         }
         Request::Scan => {
             let client = client.clone();
-            match wait_for_event(waiters, state, WaiterKind::ScanResult, timeout, move || {
-                client.lock().expect("client mutex poisoned").scan();
-            }) {
+            match wait_for_event(
+                waiters,
+                WaiterKind::ScanResult,
+                any_event(),
+                timeout,
+                move || {
+                    client.lock().expect("client mutex poisoned").scan();
+                },
+            ) {
                 Ok(Event::ScanResult(extra)) => serde_json::json!({"ok": true, "scan": extra}),
                 Ok(_) => {
                     unreachable!("WaiterKind::ScanResult only resolves with Event::ScanResult")
@@ -456,10 +482,11 @@ pub fn handle_request(
         Request::LynxModules { serial } => {
             let client = client.clone();
             let send_serial = serial.clone();
+            // First-match only: see the `WaiterKind::LynxModules` doc.
             match wait_for_event(
                 waiters,
-                state,
                 WaiterKind::LynxModules,
+                any_event(),
                 timeout,
                 move || {
                     client
@@ -535,9 +562,9 @@ pub fn handle_request(
             }
             serde_json::json!({"ok": true})
         }
-        // Watch and Shutdown are handled by the connection layer (Task 5),
-        // which needs the raw stream to push a live stream / exit the
-        // process; they never reach this dispatcher.
+        // Watch and Shutdown are handled by the connection layer, which
+        // needs the raw stream to push a live stream / exit the process;
+        // they never reach this dispatcher.
         Request::Watch { .. } | Request::Shutdown => {
             unreachable!("Watch and Shutdown are intercepted before handle_request is called")
         }
@@ -641,8 +668,8 @@ mod tests {
         let client = unreachable_client();
 
         // Simulate the robot's reply landing on the waiter registry shortly
-        // after the request goes out, the way the real event-pump thread
-        // would (Task 6 wires that thread up for real).
+        // after the request goes out, the way the real event-pump thread in
+        // `main.rs` does.
         let waiters_bg = waiters.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
         std::thread::spawn(move || {
@@ -669,6 +696,92 @@ mod tests {
         );
         assert_eq!(reply["ok"], true);
         assert_eq!(reply["opmodes"][0]["name"], "Solo (TeleOp)");
+    }
+
+    #[test]
+    fn gamepad_fails_fast_with_not_connected() {
+        let (state, waiters) = deps();
+        let client = unreachable_client();
+        let reply = handle_request(
+            Request::Gamepad {
+                left_stick_x: None,
+                left_stick_y: None,
+                right_stick_x: None,
+                right_stick_y: None,
+                left_trigger: None,
+                right_trigger: None,
+                dpad_up: None,
+                dpad_down: None,
+                dpad_left: None,
+                dpad_right: None,
+                a: None,
+                b: None,
+                x: None,
+                y: None,
+                start: None,
+                back: None,
+                left_bumper: None,
+                right_bumper: None,
+                left_stick_button: None,
+                right_stick_button: None,
+                duration_ms: None,
+            },
+            &client,
+            &state,
+            &waiters,
+            Duration::from_millis(50),
+        );
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"], "not_connected");
+    }
+
+    #[test]
+    fn init_ignores_a_stale_stop_robot_inited_event() {
+        // Mirrors `ds_agent stop; ds_agent init Foo`: the RC's late
+        // `NOTIFY_INIT_OP_MODE $Stop$Robot$` lands while the `init Foo`
+        // waiter is registered and must not resolve it.
+        let (state, waiters) = deps();
+        let peer: SocketAddr = "127.0.0.1:20884".parse().unwrap();
+        state
+            .lock()
+            .unwrap()
+            .apply_event(&Event::Connected { peer });
+        state
+            .lock()
+            .unwrap()
+            .apply_event(&Event::OpModeList(vec![robocol::cmd::OpModeMeta {
+                name: "Foo".into(),
+                flavor: "TELEOP".into(),
+                group: "drive".into(),
+            }]));
+        let client = unreachable_client();
+
+        let waiters_bg = waiters.clone();
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            ready_rx.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            waiters_bg
+                .lock()
+                .unwrap()
+                .resolve(&Event::OpModeInited(robocol::cmd::DEFAULT_OP_MODE.into()));
+            std::thread::sleep(Duration::from_millis(50));
+            waiters_bg
+                .lock()
+                .unwrap()
+                .resolve(&Event::OpModeInited("Foo".into()));
+        });
+
+        ready_tx.send(()).unwrap();
+        let reply = handle_request(
+            Request::Init { name: "Foo".into() },
+            &client,
+            &state,
+            &waiters,
+            Duration::from_secs(1),
+        );
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["name"], "Foo");
     }
 
     #[test]
