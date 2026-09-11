@@ -61,7 +61,12 @@ impl DaemonState {
             }
             Event::RobotState(state) => self.robot_state = Some(*state),
             Event::OpModeList(list) => self.opmodes = list.clone(),
-            Event::OpModeInited(name) => self.last_inited = Some(name.clone()),
+            // The RC reports `$Stop$Robot$` inited whenever an opmode ends;
+            // that is not a user choice, so a bare `run` after `stop` still
+            // targets the last real opmode.
+            Event::OpModeInited(name) if name != robocol::cmd::DEFAULT_OP_MODE => {
+                self.last_inited = Some(name.clone())
+            }
             Event::ActiveConfiguration(extra) => self.active_config = Some(extra.clone()),
             Event::ConfigurationList(extra) => self.configs = parse_config_list(extra),
             Event::UserDeviceList(extra) => self.device_types = Some(extra.clone()),
@@ -171,6 +176,23 @@ mod tests {
         let mut state = DaemonState::new();
         state.apply_event(&Event::OpModeInited("Duo (TeleOp)".into()));
         assert_eq!(state.last_inited.as_deref(), Some("Duo (TeleOp)"));
+    }
+
+    #[test]
+    fn stop_robot_inited_does_not_overwrite_last_inited() {
+        let mut state = DaemonState::new();
+        state.apply_event(&Event::OpModeInited("Duo (TeleOp)".into()));
+        state.apply_event(&Event::OpModeInited(
+            robocol::cmd::DEFAULT_OP_MODE.to_string(),
+        ));
+        assert_eq!(state.last_inited.as_deref(), Some("Duo (TeleOp)"));
+
+        // And it never becomes the fallback on its own either.
+        let mut fresh = DaemonState::new();
+        fresh.apply_event(&Event::OpModeInited(
+            robocol::cmd::DEFAULT_OP_MODE.to_string(),
+        ));
+        assert_eq!(fresh.last_inited, None);
     }
 
     #[test]

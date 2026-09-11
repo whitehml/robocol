@@ -97,7 +97,24 @@ fn main() {
         config.bind_port = port;
     }
 
-    let (client, events) = RobocolClient::start(config).expect("bind UDP socket");
+    // Claim the Unix socket first: if another daemon already owns it this
+    // exits 0 before touching UDP, so the "already running" path is
+    // reachable even with the default bind port.
+    let listener = bind_socket();
+
+    let bind_port = config.bind_port;
+    let (client, events) = match RobocolClient::start(config) {
+        Ok(started) => started,
+        Err(e) => {
+            eprintln!(
+                "ds_agentd: cannot bind UDP port {bind_port}: {e} (is Deck Station or ds_cli already running?)"
+            );
+            // Don't leave a socket file that ds_agent would mistake for a
+            // live daemon.
+            let _ = std::fs::remove_file(ds_agent_ipc::socket_path());
+            std::process::exit(1);
+        }
+    };
     let client = Arc::new(Mutex::new(client));
     let state = Arc::new(Mutex::new(DaemonState::new()));
     let waiters = Arc::new(Mutex::new(WaiterRegistry::new()));
@@ -122,11 +139,15 @@ fn main() {
                     .expect("subscribers mutex poisoned")
                     .broadcast(&event);
             }
+            // The robocol worker only drops its sender when it dies. A
+            // daemon with no robot connection must not linger answering
+            // `connected: true` from a frozen cache.
+            eprintln!("ds_agentd: robocol client stopped; exiting");
+            std::process::exit(1);
         });
     }
 
     let timeout = resolve_timeout();
-    let listener = bind_socket();
     for incoming in listener.incoming() {
         let Ok(stream) = incoming else { continue };
         let client = client.clone();

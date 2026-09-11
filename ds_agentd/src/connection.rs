@@ -13,9 +13,6 @@ use crate::request::{Request, handle_request};
 use crate::state::DaemonState;
 use crate::waiters::{Subscribers, WaiterRegistry};
 
-// Not yet wired up outside tests: Task 6's accept loop is what will spawn a
-// thread per connection calling `handle_connection`, as Tasks 2-4 noted for
-// `state`/`waiters`/`request`.
 fn event_type_name(event: &Event) -> Option<&'static str> {
     match event {
         Event::Connected { .. } => Some("connected"),
