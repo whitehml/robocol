@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use robocol::client::{ClientConfig, Event, RobocolClient};
 use robocol::cmd::{self, ConfigMeta};
-use robocol::packets::{BATTERY_LEVEL_KEY, Command, Packet, PeerDiscovery, Telemetry};
+use robocol::packets::{BATTERY_LEVEL_KEY, Command, Packet, PeerDiscovery, PeerType, Telemetry};
 use robocol::types::RobotState;
 
 fn wait_for<T>(rx: &Receiver<Event>, mut pick: impl FnMut(Event) -> Option<T>) -> T {
@@ -414,6 +414,77 @@ fn disconnect_timeout_fires_and_reconnects() {
     });
 
     drop(client);
+}
+
+fn rc_hears_anything(rc: &UdpSocket, window: Duration) -> bool {
+    rc.set_read_timeout(Some(window)).unwrap();
+    let mut buf = [0u8; 4096];
+    let heard = rc.recv_from(&mut buf).is_ok();
+    rc.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    heard
+}
+
+#[test]
+fn busy_peer_pauses_discovery_until_connect() {
+    let rc = UdpSocket::bind("127.0.0.1:0").unwrap();
+    rc.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let (client, events) = RobocolClient::start(ClientConfig {
+        bind_port: 0,
+        peer_addrs: vec!["127.0.0.1".parse().unwrap()],
+        peer_port: rc.local_addr().unwrap().port(),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let mut buf = [0u8; 4096];
+    let (_, ds_addr) = rc.recv_from(&mut buf).unwrap();
+    let busy = PeerDiscovery {
+        peer_type: PeerType::NotConnectedDueToPreexistingConnection,
+        ..Default::default()
+    };
+    rc.send_to(&busy.serialize(), ds_addr).unwrap();
+
+    wait_for(&events, |e| match e {
+        Event::PeerBusy { .. } => Some(()),
+        Event::Connected { .. } => panic!("latched a busy RC"),
+        _ => None,
+    });
+    while rc_hears_anything(&rc, Duration::from_millis(50)) {}
+    assert!(!rc_hears_anything(&rc, Duration::from_millis(600)));
+
+    client.connect();
+    let (n, from) = rc.recv_from(&mut buf).unwrap();
+    assert!(matches!(
+        Packet::parse(&buf[..n]),
+        Ok(Packet::PeerDiscovery(_))
+    ));
+    rc.send_to(&PeerDiscovery::default().serialize(), from)
+        .unwrap();
+    wait_for(&events, |e| match e {
+        Event::Connected { .. } => Some(()),
+        _ => None,
+    });
+}
+
+#[test]
+fn disconnect_drops_peer_and_goes_quiet() {
+    let (client, events, rc, ds_addr) = connect();
+
+    client.disconnect();
+    wait_for(&events, |e| match e {
+        Event::Disconnected => Some(()),
+        _ => None,
+    });
+    while rc_hears_anything(&rc, Duration::from_millis(50)) {}
+
+    rc.send_to(&PeerDiscovery::default().serialize(), ds_addr)
+        .unwrap();
+    assert!(!rc_hears_anything(&rc, Duration::from_millis(600)));
+    assert!(
+        events
+            .try_iter()
+            .all(|e| !matches!(e, Event::Connected { .. }))
+    );
 }
 
 #[test]

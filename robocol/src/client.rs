@@ -10,7 +10,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::cmd::{self, OpModeMeta};
-use crate::packets::{Command, Gamepad, Heartbeat, Packet, PeerDiscovery};
+use crate::packets::{Command, Gamepad, Heartbeat, Packet, PeerDiscovery, PeerType};
 use crate::types::RobotState;
 use crate::video::MAX_FRAME_BYTES;
 use crate::{DEFAULT_PEER_ADDRS, ROBOCOL_PORT};
@@ -49,6 +49,7 @@ impl Default for ClientConfig {
 pub enum Event {
     Connected { peer: SocketAddr },
     Disconnected,
+    PeerBusy { peer: SocketAddr },
     RobotState(RobotState),
     Telemetry(crate::packets::Telemetry),
     OpModeList(Vec<OpModeMeta>),
@@ -71,6 +72,8 @@ pub enum Event {
 enum Control {
     SendCommand(Command),
     SendGamepad(Box<Gamepad>),
+    Connect,
+    Disconnect,
     Shutdown,
 }
 
@@ -94,6 +97,7 @@ impl RobocolClient {
                     ctrl: ctrl_rx,
                     events: event_tx,
                     peer: None,
+                    discovering: true,
                     robot_state: None,
                     last_rx: Instant::now(),
                     last_beat: None,
@@ -115,6 +119,16 @@ impl RobocolClient {
             },
             event_rx,
         ))
+    }
+
+    /// Resumes discovery.
+    pub fn connect(&self) {
+        let _ = self.ctrl.send(Control::Connect);
+    }
+
+    /// Drops the current peer and pauses discovery until [`RobocolClient::connect`].
+    pub fn disconnect(&self) {
+        let _ = self.ctrl.send(Control::Disconnect);
     }
 
     pub fn send_command(&self, name: &str, extra: &str) {
@@ -232,6 +246,7 @@ struct Worker {
     ctrl: Receiver<Control>,
     events: Sender<Event>,
     peer: Option<SocketAddr>,
+    discovering: bool,
     robot_state: Option<RobotState>,
     last_rx: Instant,
     last_beat: Option<Instant>,
@@ -254,6 +269,19 @@ impl Worker {
                     Ok(Control::Shutdown) | Err(TryRecvError::Disconnected) => return,
                     Ok(Control::SendCommand(command)) => self.queue_command(command),
                     Ok(Control::SendGamepad(gamepad)) => self.transmit_gamepad(*gamepad),
+                    Ok(Control::Connect) => {
+                        self.discovering = true;
+                        self.last_beat = None;
+                    }
+                    Ok(Control::Disconnect) => {
+                        self.discovering = false;
+                        if self.peer.is_some() {
+                            self.drop_peer();
+                            if self.events.send(Event::Disconnected).is_err() {
+                                return;
+                            }
+                        }
+                    }
                     Err(TryRecvError::Empty) => break,
                 }
             }
@@ -279,13 +307,7 @@ impl Worker {
             }
 
             if self.peer.is_some() && self.last_rx.elapsed() > self.cfg.disconnect_timeout {
-                self.peer = None;
-                self.robot_state = None;
-                self.pending.clear();
-                self.seen.clear();
-                self.webcam_frames.clear();
-                self.webcam_available = false;
-                self.webcam_pending_request = false;
+                self.drop_peer();
                 if self.events.send(Event::Disconnected).is_err() {
                     return;
                 }
@@ -320,8 +342,19 @@ impl Worker {
         }
     }
 
+    fn drop_peer(&mut self) {
+        self.peer = None;
+        self.robot_state = None;
+        self.pending.clear();
+        self.seen.clear();
+        self.webcam_frames.clear();
+        self.webcam_available = false;
+        self.webcam_pending_request = false;
+    }
+
     fn tick(&mut self) {
         match self.peer {
+            None if !self.discovering => {}
             None => {
                 let discovery = PeerDiscovery::default().serialize();
                 for addr in &self.cfg.peer_addrs {
@@ -409,6 +442,9 @@ impl Worker {
                 )))
                 .is_ok();
         }
+        if self.peer.is_none() && !self.discovering {
+            return true;
+        }
         self.last_rx = Instant::now();
 
         let packet = match Packet::parse(data) {
@@ -422,6 +458,12 @@ impl Worker {
         };
 
         if self.peer.is_none() {
+            if let Packet::PeerDiscovery(reply) = &packet
+                && reply.peer_type == PeerType::NotConnectedDueToPreexistingConnection
+            {
+                self.discovering = false;
+                return self.events.send(Event::PeerBusy { peer: from }).is_ok();
+            }
             self.peer = Some(from);
             if self.events.send(Event::Connected { peer: from }).is_err() {
                 return false;

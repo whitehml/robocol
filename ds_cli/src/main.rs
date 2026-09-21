@@ -5,7 +5,7 @@
 //! cargo run -p ds_cli            # tries 192.168.43.1 / 192.168.49.1
 //! cargo run -p ds_cli 10.0.0.5   # explicit RC address
 //! ```
-//! Commands: `list`, `init <name>`, `run`, `stop`, `restart`, `quit`,
+//! Commands: `list`, `init <name>`, `run`, `stop`, `restart`, `connect`, `disconnect`, `quit`,
 //! `active-config`, `configs`, `config <name>`, `save-config <json>`,
 //! `activate-config <name>`, `delete-config <name>`, `device-types`,
 //! `scan`, `lynx-modules <serial>`, `w` (pulse gamepad1 forward stick).
@@ -62,7 +62,10 @@ fn main() {
         for event in events {
             let line = match event {
                 Event::Connected { peer } => format!("<< connected to {peer}"),
-                Event::Disconnected => "<< disconnected, rediscovering...".to_string(),
+                Event::Disconnected => "<< disconnected".to_string(),
+                Event::PeerBusy { peer } => {
+                    format!("!! {peer} is connected to another DS; `connect` to retry")
+                }
                 Event::RobotState(state) => format!("<< robot state: {state:?}"),
                 Event::OpModeList(list) => {
                     let mut s = "<< opmodes:".to_string();
@@ -130,6 +133,8 @@ fn main() {
             }
             ("stop", _) => client.stop_opmode(),
             ("restart", _) => client.restart_robot(),
+            ("connect", _) => client.connect(),
+            ("disconnect", _) => client.disconnect(),
             ("active-config", _) => client.request_active_config(),
             ("configs", _) => client.request_configurations(),
             ("config", Some(name)) => match find_config(&known_configs, name) {
