@@ -134,10 +134,10 @@ struct FakeRc {
     run_started: Option<Instant>,
     configs: Vec<ConfigMeta>,
     active_config: ConfigMeta,
-    /// Device XML saved per config name, served back on a particular-config
+    /// Device XML saved per config (location, name), served back on a particular-config
     /// request so editor round-trips work; unsaved configs fall back to
     /// FAKE_CONFIG_XML.
-    saved_xml: HashMap<String, String>,
+    saved_xml: HashMap<(String, String), String>,
     next_resource_id: i64,
     /// Set by CMD_ACTIVATE_CONFIGURATION, applied on the restart that
     /// follows — matches real hardware, where activation only takes
@@ -145,6 +145,10 @@ struct FakeRc {
     pending_activation: Option<ConfigMeta>,
     webcam_available: bool,
     webcam_frame_num: i32,
+}
+
+fn config_key(meta: &ConfigMeta) -> (String, String) {
+    (meta.location.clone(), meta.name.clone())
 }
 
 impl FakeRc {
@@ -229,7 +233,7 @@ impl FakeRc {
             cmd::REQUEST_PARTICULAR_CONFIGURATION => {
                 let xml = serde_json::from_str::<ConfigMeta>(&command.extra)
                     .ok()
-                    .and_then(|meta| self.saved_xml.get(&meta.name).cloned())
+                    .and_then(|meta| self.saved_xml.get(&config_key(&meta)).cloned())
                     .unwrap_or_else(|| FAKE_CONFIG_XML.to_string());
                 self.send_command(cmd::REQUEST_PARTICULAR_CONFIGURATION_RESP, &xml);
             }
@@ -256,8 +260,12 @@ impl FakeRc {
                     self.next_resource_id += 1;
                     meta.resource_id = self.next_resource_id;
                 }
-                self.saved_xml.insert(meta.name.clone(), xml.to_string());
-                match self.configs.iter_mut().find(|c| c.name == meta.name) {
+                self.saved_xml.insert(config_key(&meta), xml.to_string());
+                match self
+                    .configs
+                    .iter_mut()
+                    .find(|c| config_key(c) == config_key(&meta))
+                {
                     Some(existing) => *existing = meta.clone(),
                     None => self.configs.push(meta.clone()),
                 }
@@ -272,7 +280,7 @@ impl FakeRc {
             }
             cmd::DELETE_CONFIGURATION => {
                 if let Ok(meta) = serde_json::from_str::<ConfigMeta>(&command.extra) {
-                    self.configs.retain(|c| c.name != meta.name);
+                    self.configs.retain(|c| config_key(c) != config_key(&meta));
                 }
             }
             _ => {}
