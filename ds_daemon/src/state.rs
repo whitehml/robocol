@@ -16,6 +16,9 @@ pub struct DaemonState {
     /// The RC that answered discovery as already owned by another driver
     /// station. Discovery stays paused until a `connect` request.
     pub peer_busy: Option<String>,
+    /// The opmode inited or running on the RC; `None` once it stops
+    /// (`$Stop$Robot$` is inited) or the RC goes away.
+    pub opmode: Option<String>,
     pub robot_state: Option<RobotState>,
     pub opmodes: Vec<OpModeMeta>,
     pub active_config: Option<String>,
@@ -37,6 +40,7 @@ impl DaemonState {
             connected: false,
             peer: None,
             peer_busy: None,
+            opmode: None,
             robot_state: None,
             opmodes: Vec::new(),
             active_config: None,
@@ -59,12 +63,18 @@ impl DaemonState {
                 self.connected = false;
                 self.peer = None;
                 self.peer_busy = Some(peer.to_string());
+                self.opmode = None;
             }
             Event::Disconnected => {
                 self.connected = false;
                 self.peer = None;
                 self.robot_state = None;
+                self.opmode = None;
             }
+            Event::OpModeInited(name) => {
+                self.opmode = (name != robocol::cmd::DEFAULT_OP_MODE).then(|| name.clone());
+            }
+            Event::OpModeRunning(name) => self.opmode = Some(name.clone()),
             Event::RobotState(state) => self.robot_state = Some(*state),
             Event::OpModeList(list) => self.opmodes = list.clone(),
             Event::ActiveConfiguration(extra) => self.active_config = Some(extra.clone()),
@@ -103,6 +113,7 @@ impl DaemonState {
             "connected": self.connected,
             "peer": self.peer,
             "peer_busy": self.peer_busy,
+            "opmode": self.opmode,
             "robot_state": self.robot_state.map(|s| format!("{s:?}")),
             "opmodes": opmodes,
             "active_config": self.active_config,
@@ -156,6 +167,19 @@ mod tests {
         state.apply_event(&Event::Connected { peer });
         assert!(state.connected);
         assert_eq!(state.peer_busy, None);
+    }
+
+    #[test]
+    fn the_current_opmode_follows_init_run_and_stop() {
+        let mut state = DaemonState::new();
+        state.apply_event(&Event::OpModeInited("Duo (TeleOp)".into()));
+        assert_eq!(state.to_json()["opmode"], "Duo (TeleOp)");
+        state.apply_event(&Event::OpModeRunning("Duo (TeleOp)".into()));
+        assert_eq!(state.opmode.as_deref(), Some("Duo (TeleOp)"));
+        state.apply_event(&Event::OpModeInited(
+            robocol::cmd::DEFAULT_OP_MODE.to_string(),
+        ));
+        assert_eq!(state.opmode, None);
     }
 
     #[test]

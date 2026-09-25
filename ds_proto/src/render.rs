@@ -59,6 +59,9 @@ fn render_event(kind: &str, e: &Value) -> String {
         "command_dropped" => format!("!! command {} never acked", text(&e["name"])),
         "protocol_error" => format!("!! protocol error: {}", text(&e["message"])),
         "webcam_available" => format!("<< webcam available: {}", text(&e["available"])),
+        "opmode_inited" => format!("<< INIT: {}", text(&e["name"])),
+        "opmode_running" => format!("<< RUNNING: {}", text(&e["name"])),
+        "command" => format!("<< command {}: {}", text(&e["name"]), text(&e["extra"])),
         "gamepad_owner" => format!(
             "<< gamepad{}: {} -> {}",
             text(&e["user"]),
@@ -153,6 +156,12 @@ mod tests {
         let released =
             json!({"event": "gamepad_owner", "user": 1, "owner": null, "previous": "operator"});
         assert_eq!(render(&released), "<< gamepad1: operator -> nobody");
+    }
+
+    #[test]
+    fn opmode_changes_read_like_the_driver_station() {
+        let event = json!({"event": "opmode_running", "name": "Duo (TeleOp)"});
+        assert_eq!(render(&event), "<< RUNNING: Duo (TeleOp)");
     }
 
     #[test]

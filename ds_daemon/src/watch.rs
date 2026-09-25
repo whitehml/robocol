@@ -21,13 +21,17 @@ pub fn telemetry_json(t: &Telemetry) -> Value {
     json!({"strings": strings, "numbers": numbers})
 }
 
-/// `None` for events with no watch representation: request replies such as
-/// `OpModeList`, and raw webcam frames.
+/// `None` for events with no watch representation: replies to requests such
+/// as `OpModeList` (they go to the request that asked), and raw webcam
+/// frames.
 pub fn watch_json(event: &Event) -> Option<Value> {
     Some(match event {
         Event::Connected { peer } => json!({"event": "connected", "peer": peer.to_string()}),
         Event::Disconnected => json!({"event": "disconnected"}),
         Event::PeerBusy { peer } => json!({"event": "peer_busy", "peer": peer.to_string()}),
+        Event::OpModeInited(name) => json!({"event": "opmode_inited", "name": name}),
+        Event::OpModeRunning(name) => json!({"event": "opmode_running", "name": name}),
+        Event::Command { name, extra } => json!({"event": "command", "name": name, "extra": extra}),
         Event::RobotState(s) => json!({"event": "state", "state": format!("{s:?}")}),
         Event::Telemetry(t) => {
             let mut event = telemetry_json(t);
@@ -84,6 +88,22 @@ mod tests {
         assert_eq!(
             watch_json(&Event::PeerBusy { peer }),
             Some(json!({"event": "peer_busy", "peer": "192.168.43.1:20884"}))
+        );
+    }
+
+    #[test]
+    fn opmode_changes_and_rc_commands_are_watch_events() {
+        assert_eq!(
+            watch_json(&Event::OpModeRunning("Duo (TeleOp)".into())),
+            Some(json!({"event": "opmode_running", "name": "Duo (TeleOp)"}))
+        );
+        let command = Event::Command {
+            name: "CMD_SHOW_TOAST".into(),
+            extra: "hello".into(),
+        };
+        assert_eq!(
+            watch_json(&command),
+            Some(json!({"event": "command", "name": "CMD_SHOW_TOAST", "extra": "hello"}))
         );
     }
 

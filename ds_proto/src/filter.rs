@@ -16,6 +16,9 @@ pub const EVENT_TYPES: &[&str] = &[
     "protocol_error",
     "webcam_available",
     "gamepad_owner",
+    "opmode_inited",
+    "opmode_running",
+    "command",
 ];
 
 /// Which watch events to show. A `None` field places no restriction.
