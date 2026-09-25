@@ -1,641 +1,522 @@
 //! Turns one `ds_proto::Request` into `robocol` client calls and a JSON
-//! reply, using `DaemonState` for instant answers (`status`) and name
-//! lookups, and `WaiterRegistry` to correlate a request with the `Event` that
-//! answers it.
+//! reply. `Daemon` is what every connection shares; `Session` is what
+//! belongs to one connection. Nothing here knows about sockets, so any
+//! transport can drive `handle_request`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use ds_proto::Request;
+use ds_proto::{Request, Role};
 use robocol::client::{Event, RobocolClient};
-use robocol::cmd::parse_config_list;
+use robocol::cmd::{ConfigMeta, parse_config_list};
 use robocol::packets::Gamepad;
+use serde_json::{Value, json};
 
 use crate::gamepad::to_packet;
 use crate::state::DaemonState;
-use crate::waiters::{WaiterKind, WaiterPredicate, WaiterRegistry};
+use crate::waiters::{Subscribers, WaiterKind, WaiterPredicate, WaiterRegistry};
 
-fn err(code: &str, message: impl Into<String>) -> serde_json::Value {
-    serde_json::json!({"ok": false, "error": code, "message": message.into()})
+/// Everything a request can touch, shared by every connection.
+pub struct Daemon {
+    pub client: Mutex<RobocolClient>,
+    pub state: Mutex<DaemonState>,
+    pub waiters: Mutex<WaiterRegistry>,
+    pub subscribers: Mutex<Subscribers>,
+    /// How long a request waits for the RC's answer.
+    pub timeout: Duration,
 }
 
-/// Every command except `ping`/`status` fails fast with `not_connected`
-/// when the daemon has never seen `Event::Connected`, rather than waiting
-/// out a timeout or silently dropping a packet that has no peer to go to.
-fn ensure_connected(state: &Arc<Mutex<DaemonState>>) -> Result<(), serde_json::Value> {
-    if state.lock().expect("state mutex poisoned").connected {
+impl Daemon {
+    pub fn new(client: RobocolClient, timeout: Duration) -> Daemon {
+        Daemon {
+            client: Mutex::new(client),
+            state: Mutex::new(DaemonState::new()),
+            waiters: Mutex::new(WaiterRegistry::new()),
+            subscribers: Mutex::new(Subscribers::new()),
+            timeout,
+        }
+    }
+
+    fn client(&self) -> MutexGuard<'_, RobocolClient> {
+        self.client.lock().expect("client mutex poisoned")
+    }
+
+    fn state(&self) -> MutexGuard<'_, DaemonState> {
+        self.state.lock().expect("state mutex poisoned")
+    }
+
+    fn waiters(&self) -> MutexGuard<'_, WaiterRegistry> {
+        self.waiters.lock().expect("waiters mutex poisoned")
+    }
+}
+
+/// What belongs to one connection.
+pub struct Session {
+    /// Who is on the other end; set by `hello`, `Agent` until then.
+    pub role: Role,
+    /// The opmode this connection last inited, for a bare `run`.
+    pub last_inited: Option<String>,
+}
+
+impl Session {
+    pub fn new() -> Session {
+        Session {
+            role: Role::Agent,
+            last_inited: None,
+        }
+    }
+}
+
+fn err(code: &str, message: impl Into<String>) -> Value {
+    json!({"ok": false, "error": code, "message": message.into()})
+}
+
+/// Requests that talk to the robot. The rest are answered by the daemon
+/// alone and work with no RC connected.
+fn needs_rc(request: &Request) -> bool {
+    !matches!(
+        request,
+        Request::Hello { .. }
+            | Request::Ping
+            | Request::Status
+            | Request::Watch
+            | Request::Shutdown
+    )
+}
+
+/// Fails fast with `not_connected` before any request that needs the RC,
+/// rather than waiting out a timeout or silently dropping a packet that has
+/// no peer to go to.
+fn ensure_connected(daemon: &Daemon) -> Result<(), Value> {
+    if daemon.state().connected {
         Ok(())
     } else {
         Err(err("not_connected", "robot controller not connected yet"))
     }
 }
 
-/// Predicate for commands whose response carries nothing to match on.
+/// Predicate for requests whose answer carries nothing to match on.
 fn any_event() -> WaiterPredicate {
     Box::new(|_| true)
 }
 
-fn check_known_opmode(state: &Arc<Mutex<DaemonState>>, name: &str) -> Option<serde_json::Value> {
-    let state = state.lock().expect("state mutex poisoned");
+/// A waiter only ever resolves with an event of its own kind.
+fn wrong_kind(event: Event) -> ! {
+    unreachable!("waiter resolved with an event of another kind: {event:?}")
+}
+
+fn check_known_opmode(daemon: &Daemon, name: &str) -> Result<(), Value> {
+    let state = daemon.state();
     if state.opmodes.is_empty() || state.find_opmode(name) {
-        None
+        Ok(())
     } else {
-        Some(err(
+        Err(err(
             "unknown_opmode",
             format!("no opmode named {name:?}; run `list` first"),
         ))
     }
 }
 
-/// Registers a waiter for `kind` events accepted by `pred`, fires `send`
-/// (which must issue exactly one `robocol` request), and blocks up to
-/// `timeout` for the matching event. Callers must have already passed
-/// `ensure_connected`.
+fn known_config(daemon: &Daemon, name: &str) -> Result<ConfigMeta, Value> {
+    daemon.state().find_config(name).ok_or_else(|| {
+        err(
+            "unknown_config",
+            format!("unknown config {name:?}; run `configs` first"),
+        )
+    })
+}
+
+/// Registers a waiter for `kind` events accepted by `pred`, runs `send`
+/// (which must issue exactly one `robocol` request), and blocks up to the
+/// daemon's timeout for the matching event. No lock is held while waiting.
 fn wait_for_event(
-    waiters: &Arc<Mutex<WaiterRegistry>>,
+    daemon: &Daemon,
     kind: WaiterKind,
     pred: WaiterPredicate,
-    timeout: Duration,
-    send: impl FnOnce(),
-) -> Result<Event, serde_json::Value> {
-    let (id, rx) = waiters
-        .lock()
-        .expect("waiters mutex poisoned")
-        .register(kind, pred);
-    send();
-    rx.recv_timeout(timeout).map_err(|_| {
+    send: impl FnOnce(&RobocolClient),
+) -> Result<Event, Value> {
+    let (id, rx) = daemon.waiters().register(kind, pred);
+    send(&daemon.client());
+    rx.recv_timeout(daemon.timeout).map_err(|_| {
         // A payload-matched waiter (`init Foo`) would otherwise linger until
         // a matching event that may never arrive.
-        waiters
-            .lock()
-            .expect("waiters mutex poisoned")
-            .unregister(id);
+        daemon.waiters().unregister(id);
         err("timeout", "robot controller did not respond in time")
     })
 }
 
-pub fn handle_request(
-    req: Request,
-    client: &Arc<Mutex<RobocolClient>>,
-    state: &Arc<Mutex<DaemonState>>,
-    waiters: &Arc<Mutex<WaiterRegistry>>,
-    timeout: Duration,
-) -> serde_json::Value {
-    match &req {
-        Request::Ping | Request::Status => {}
-        _ => {
-            if let Err(e) = ensure_connected(state) {
-                return e;
-            }
-        }
+pub fn handle_request(request: Request, session: &mut Session, daemon: &Daemon) -> Value {
+    if needs_rc(&request)
+        && let Err(e) = ensure_connected(daemon)
+    {
+        return e;
     }
-    match req {
-        Request::Ping => serde_json::json!({"ok": true}),
-        Request::Status => state.lock().expect("state mutex poisoned").to_json(),
-        Request::List => {
-            let client = client.clone();
-            match wait_for_event(
-                waiters,
-                WaiterKind::OpModeList,
-                any_event(),
-                timeout,
-                move || {
-                    client
-                        .lock()
-                        .expect("client mutex poisoned")
-                        .request_opmode_list();
-                },
-            ) {
-                Ok(Event::OpModeList(list)) => serde_json::json!({
-                    "ok": true,
-                    "opmodes": list.iter().map(|m| serde_json::json!({
-                        "name": m.name, "flavor": m.flavor, "group": m.group,
-                    })).collect::<Vec<_>>(),
-                }),
-                Ok(_) => {
-                    unreachable!("WaiterKind::OpModeList only resolves with Event::OpModeList")
-                }
-                Err(e) => e,
-            }
+    match request {
+        Request::Hello { role } => {
+            session.role = role;
+            json!({"ok": true, "role": role})
         }
+        Request::Ping => json!({"ok": true}),
+        Request::Status => daemon.state().to_json(),
+        Request::List => match wait_for_event(daemon, WaiterKind::OpModeList, any_event(), |c| {
+            c.request_opmode_list()
+        }) {
+            Ok(Event::OpModeList(list)) => json!({
+                "ok": true,
+                "opmodes": list.iter().map(|m| json!({
+                    "name": m.name, "flavor": m.flavor, "group": m.group,
+                })).collect::<Vec<_>>(),
+            }),
+            Ok(other) => wrong_kind(other),
+            Err(e) => e,
+        },
         Request::Init { name } => {
-            if let Some(e) = check_known_opmode(state, &name) {
+            if let Err(e) = check_known_opmode(daemon, &name) {
                 return e;
             }
-            let client = client.clone();
-            let send_name = name.clone();
             let want = name.clone();
             match wait_for_event(
-                waiters,
+                daemon,
                 WaiterKind::OpModeInited,
                 Box::new(move |e| matches!(e, Event::OpModeInited(n) if *n == want)),
-                timeout,
-                move || {
-                    client
-                        .lock()
-                        .expect("client mutex poisoned")
-                        .init_opmode(&send_name);
-                },
+                |c| c.init_opmode(&name),
             ) {
-                Ok(Event::OpModeInited(n)) => serde_json::json!({"ok": true, "name": n}),
-                Ok(_) => {
-                    unreachable!("WaiterKind::OpModeInited only resolves with Event::OpModeInited")
+                Ok(Event::OpModeInited(n)) => {
+                    session.last_inited = Some(n.clone());
+                    json!({"ok": true, "name": n})
                 }
+                Ok(other) => wrong_kind(other),
                 Err(e) => e,
             }
         }
         Request::Run { name } => {
-            let name = match name.or_else(|| {
-                state
-                    .lock()
-                    .expect("state mutex poisoned")
-                    .last_inited
-                    .clone()
-            }) {
-                Some(n) => n,
-                None => {
-                    return err(
-                        "bad_args",
-                        "no opmode inited; call `init <name>` first or pass a name",
-                    );
-                }
+            let Some(name) = name.or_else(|| session.last_inited.clone()) else {
+                return err(
+                    "bad_args",
+                    "nothing inited on this connection; use `run <name>`",
+                );
             };
-            if let Some(e) = check_known_opmode(state, &name) {
+            if let Err(e) = check_known_opmode(daemon, &name) {
                 return e;
             }
-            let client = client.clone();
-            let send_name = name.clone();
             let want = name.clone();
             match wait_for_event(
-                waiters,
+                daemon,
                 WaiterKind::OpModeRunning,
                 Box::new(move |e| matches!(e, Event::OpModeRunning(n) if *n == want)),
-                timeout,
-                move || {
-                    client
-                        .lock()
-                        .expect("client mutex poisoned")
-                        .run_opmode(&send_name);
-                },
+                |c| c.run_opmode(&name),
             ) {
-                Ok(Event::OpModeRunning(n)) => serde_json::json!({"ok": true, "name": n}),
-                Ok(_) => unreachable!(
-                    "WaiterKind::OpModeRunning only resolves with Event::OpModeRunning"
-                ),
+                Ok(Event::OpModeRunning(n)) => json!({"ok": true, "name": n}),
+                Ok(other) => wrong_kind(other),
                 Err(e) => e,
             }
         }
         Request::Stop => {
-            client.lock().expect("client mutex poisoned").stop_opmode();
-            serde_json::json!({"ok": true})
+            daemon.client().stop_opmode();
+            json!({"ok": true})
         }
         Request::Restart => {
-            client
-                .lock()
-                .expect("client mutex poisoned")
-                .restart_robot();
-            serde_json::json!({"ok": true})
+            daemon.client().restart_robot();
+            json!({"ok": true})
         }
         Request::ActiveConfig => {
-            let client = client.clone();
-            match wait_for_event(
-                waiters,
-                WaiterKind::ActiveConfiguration,
-                any_event(),
-                timeout,
-                move || {
-                    client
-                        .lock()
-                        .expect("client mutex poisoned")
-                        .request_active_config();
-                },
-            ) {
-                Ok(Event::ActiveConfiguration(extra)) => {
-                    serde_json::json!({"ok": true, "config": extra})
-                }
-                Ok(_) => unreachable!(
-                    "WaiterKind::ActiveConfiguration only resolves with Event::ActiveConfiguration"
-                ),
+            match wait_for_event(daemon, WaiterKind::ActiveConfiguration, any_event(), |c| {
+                c.request_active_config()
+            }) {
+                Ok(Event::ActiveConfiguration(extra)) => json!({"ok": true, "config": extra}),
+                Ok(other) => wrong_kind(other),
                 Err(e) => e,
             }
         }
         Request::Configs => {
-            let client = client.clone();
-            match wait_for_event(
-                waiters,
-                WaiterKind::ConfigurationList,
-                any_event(),
-                timeout,
-                move || {
-                    client
-                        .lock()
-                        .expect("client mutex poisoned")
-                        .request_configurations();
-                },
-            ) {
+            match wait_for_event(daemon, WaiterKind::ConfigurationList, any_event(), |c| {
+                c.request_configurations()
+            }) {
                 Ok(Event::ConfigurationList(extra)) => {
-                    serde_json::json!({"ok": true, "configs": parse_config_list(&extra)})
+                    json!({"ok": true, "configs": parse_config_list(&extra)})
                 }
-                Ok(_) => unreachable!(
-                    "WaiterKind::ConfigurationList only resolves with Event::ConfigurationList"
-                ),
+                Ok(other) => wrong_kind(other),
                 Err(e) => e,
             }
         }
         Request::Config { name } => {
-            let Some(meta) = state
-                .lock()
-                .expect("state mutex poisoned")
-                .find_config(&name)
-            else {
-                return err(
-                    "unknown_config",
-                    format!("unknown config {name:?}; run `configs` first"),
-                );
+            let meta = match known_config(daemon, &name) {
+                Ok(meta) => meta,
+                Err(e) => return e,
             };
-            let client = client.clone();
-            match wait_for_event(
-                waiters,
-                WaiterKind::Configuration,
-                any_event(),
-                timeout,
-                move || {
-                    client
-                        .lock()
-                        .expect("client mutex poisoned")
-                        .request_particular_configuration(&meta);
-                },
-            ) {
-                Ok(Event::Configuration(extra)) => serde_json::json!({"ok": true, "config": extra}),
-                Ok(_) => unreachable!(
-                    "WaiterKind::Configuration only resolves with Event::Configuration"
-                ),
+            match wait_for_event(daemon, WaiterKind::Configuration, any_event(), |c| {
+                c.request_particular_configuration(&meta)
+            }) {
+                Ok(Event::Configuration(extra)) => json!({"ok": true, "config": extra}),
+                Ok(other) => wrong_kind(other),
                 Err(e) => e,
             }
         }
         Request::SaveConfig { json } => {
-            client
-                .lock()
-                .expect("client mutex poisoned")
-                .save_configuration(&json);
-            serde_json::json!({"ok": true})
+            daemon.client().save_configuration(&json);
+            json!({"ok": true})
         }
-        Request::ActivateConfig { name } => {
-            let Some(meta) = state
-                .lock()
-                .expect("state mutex poisoned")
-                .find_config(&name)
-            else {
-                return err(
-                    "unknown_config",
-                    format!("unknown config {name:?}; run `configs` first"),
-                );
-            };
-            client
-                .lock()
-                .expect("client mutex poisoned")
-                .activate_configuration(&meta);
-            serde_json::json!({"ok": true})
-        }
-        Request::DeleteConfig { name } => {
-            let Some(meta) = state
-                .lock()
-                .expect("state mutex poisoned")
-                .find_config(&name)
-            else {
-                return err(
-                    "unknown_config",
-                    format!("unknown config {name:?}; run `configs` first"),
-                );
-            };
-            client
-                .lock()
-                .expect("client mutex poisoned")
-                .delete_configuration(&meta);
-            serde_json::json!({"ok": true})
-        }
+        Request::ActivateConfig { name } => match known_config(daemon, &name) {
+            Ok(meta) => {
+                daemon.client().activate_configuration(&meta);
+                json!({"ok": true})
+            }
+            Err(e) => e,
+        },
+        Request::DeleteConfig { name } => match known_config(daemon, &name) {
+            Ok(meta) => {
+                daemon.client().delete_configuration(&meta);
+                json!({"ok": true})
+            }
+            Err(e) => e,
+        },
         Request::DeviceTypes => {
-            let client = client.clone();
-            match wait_for_event(
-                waiters,
-                WaiterKind::UserDeviceList,
-                any_event(),
-                timeout,
-                move || {
-                    client
-                        .lock()
-                        .expect("client mutex poisoned")
-                        .request_user_device_types();
-                },
-            ) {
-                Ok(Event::UserDeviceList(extra)) => {
-                    serde_json::json!({"ok": true, "device_types": extra})
-                }
-                Ok(_) => unreachable!(
-                    "WaiterKind::UserDeviceList only resolves with Event::UserDeviceList"
-                ),
+            match wait_for_event(daemon, WaiterKind::UserDeviceList, any_event(), |c| {
+                c.request_user_device_types()
+            }) {
+                Ok(Event::UserDeviceList(extra)) => json!({"ok": true, "device_types": extra}),
+                Ok(other) => wrong_kind(other),
                 Err(e) => e,
             }
         }
         Request::Scan => {
-            let client = client.clone();
-            match wait_for_event(
-                waiters,
-                WaiterKind::ScanResult,
-                any_event(),
-                timeout,
-                move || {
-                    client.lock().expect("client mutex poisoned").scan();
-                },
-            ) {
-                Ok(Event::ScanResult(extra)) => serde_json::json!({"ok": true, "scan": extra}),
-                Ok(_) => {
-                    unreachable!("WaiterKind::ScanResult only resolves with Event::ScanResult")
-                }
+            match wait_for_event(daemon, WaiterKind::ScanResult, any_event(), |c| c.scan()) {
+                Ok(Event::ScanResult(extra)) => json!({"ok": true, "scan": extra}),
+                Ok(other) => wrong_kind(other),
                 Err(e) => e,
             }
         }
         Request::LynxModules { serial } => {
-            let client = client.clone();
-            let send_serial = serial.clone();
             // First-match only: see the `WaiterKind::LynxModules` doc.
-            match wait_for_event(
-                waiters,
-                WaiterKind::LynxModules,
-                any_event(),
-                timeout,
-                move || {
-                    client
-                        .lock()
-                        .expect("client mutex poisoned")
-                        .discover_lynx_modules(&send_serial);
-                },
-            ) {
+            match wait_for_event(daemon, WaiterKind::LynxModules, any_event(), |c| {
+                c.discover_lynx_modules(&serial)
+            }) {
                 Ok(Event::LynxModules(extra)) => {
-                    serde_json::json!({"ok": true, "serial": serial, "modules": extra})
+                    json!({"ok": true, "serial": serial, "modules": extra})
                 }
-                Ok(_) => {
-                    unreachable!("WaiterKind::LynxModules only resolves with Event::LynxModules")
-                }
+                Ok(other) => wrong_kind(other),
                 Err(e) => e,
             }
         }
         Request::Gamepad(input) => {
-            let gamepad = to_packet(&input);
-            client
-                .lock()
-                .expect("client mutex poisoned")
-                .send_gamepad(gamepad);
+            daemon.client().send_gamepad(to_packet(&input));
             if let Some(ms) = input.duration_ms {
                 std::thread::sleep(Duration::from_millis(ms));
-                client
-                    .lock()
-                    .expect("client mutex poisoned")
-                    .send_gamepad(Gamepad::default());
+                daemon.client().send_gamepad(Gamepad::default());
             }
-            serde_json::json!({"ok": true})
+            json!({"ok": true})
         }
-        // Watch and Shutdown are handled by the connection layer, which
-        // needs the raw stream to push a live stream / exit the process;
-        // they never reach this dispatcher.
+        // The connection layer handles these: `watch` takes over the stream
+        // and `shutdown` exits the process, so neither reaches dispatch.
         Request::Watch | Request::Shutdown => {
-            unreachable!("Watch and Shutdown are intercepted before handle_request is called")
+            unreachable!("watch and shutdown are handled by the connection layer")
         }
     }
 }
 
 #[cfg(test)]
+pub(crate) fn test_daemon(timeout: Duration) -> std::sync::Arc<Daemon> {
+    // A real UDP socket pointed at a port nothing answers, so the daemon
+    // never sees `Event::Connected` unless a test applies one.
+    let config = robocol::ClientConfig {
+        bind_port: 0,
+        peer_addrs: vec!["127.0.0.1".parse().unwrap()],
+        peer_port: 1,
+        ..Default::default()
+    };
+    let (client, _events) = RobocolClient::start(config).expect("bind UDP socket");
+    std::sync::Arc::new(Daemon::new(client, timeout))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::SocketAddr;
-    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::Instant;
 
-    fn deps() -> (Arc<Mutex<DaemonState>>, Arc<Mutex<WaiterRegistry>>) {
-        (
-            Arc::new(Mutex::new(DaemonState::new())),
-            Arc::new(Mutex::new(WaiterRegistry::new())),
-        )
+    fn connected(daemon: &Daemon) {
+        let peer = "127.0.0.1:20884".parse().unwrap();
+        daemon.state().apply_event(&Event::Connected { peer });
     }
 
-    fn unreachable_client() -> Arc<Mutex<RobocolClient>> {
-        // Binds a real socket but points at an address nothing answers, so
-        // it never emits Event::Connected — exactly the "not connected" case.
-        let config = robocol::ClientConfig {
-            bind_port: 0,
-            peer_addrs: vec!["127.0.0.1".parse().unwrap()],
-            peer_port: 1, // nothing listens on port 1
-            ..Default::default()
-        };
-        let (client, _events) = RobocolClient::start(config).expect("bind UDP socket");
-        Arc::new(Mutex::new(client))
+    fn with_opmodes(daemon: &Daemon, names: &[&str]) {
+        let list = names
+            .iter()
+            .map(|n| robocol::cmd::OpModeMeta {
+                name: n.to_string(),
+                flavor: "TELEOP".into(),
+                group: "drive".into(),
+            })
+            .collect();
+        daemon.state().apply_event(&Event::OpModeList(list));
+    }
+
+    /// Plays the RC from another thread: waits for a request to register its
+    /// waiter, then resolves `events` in order, 20 ms apart.
+    fn answer(daemon: &Arc<Daemon>, events: Vec<Event>) {
+        let daemon = daemon.clone();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while daemon.waiters().len() == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            for event in events {
+                daemon.waiters().resolve(&event);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
     }
 
     #[test]
-    fn status_answers_without_touching_the_client_or_waiters() {
-        let (state, waiters) = deps();
-        let client = unreachable_client();
-        let reply = handle_request(
-            Request::Status,
-            &client,
-            &state,
-            &waiters,
-            Duration::from_millis(50),
-        );
+    fn status_answers_without_an_rc() {
+        let daemon = test_daemon(Duration::from_millis(50));
+        let reply = handle_request(Request::Status, &mut Session::new(), &daemon);
         assert_eq!(reply["ok"], true);
         assert_eq!(reply["connected"], false);
     }
 
     #[test]
-    fn list_fails_fast_with_not_connected() {
-        let (state, waiters) = deps();
-        let client = unreachable_client();
+    fn hello_sets_the_session_role() {
+        let daemon = test_daemon(Duration::from_millis(50));
+        let mut session = Session::new();
+        assert_eq!(session.role, Role::Agent);
         let reply = handle_request(
-            Request::List,
-            &client,
-            &state,
-            &waiters,
-            Duration::from_secs(5),
+            Request::Hello {
+                role: Role::Operator,
+            },
+            &mut session,
+            &daemon,
         );
-        assert_eq!(reply["ok"], false);
+        assert_eq!(reply, json!({"ok": true, "role": "operator"}));
+        assert_eq!(session.role, Role::Operator);
+    }
+
+    #[test]
+    fn list_fails_fast_with_not_connected() {
+        let daemon = test_daemon(Duration::from_secs(5));
+        let started = Instant::now();
+        let reply = handle_request(Request::List, &mut Session::new(), &daemon);
+        assert_eq!(reply["error"], "not_connected");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn gamepad_fails_fast_with_not_connected() {
+        let daemon = test_daemon(Duration::from_millis(50));
+        let reply = handle_request(
+            Request::Gamepad(ds_proto::GamepadInput::default()),
+            &mut Session::new(),
+            &daemon,
+        );
         assert_eq!(reply["error"], "not_connected");
     }
 
     #[test]
     fn init_rejects_unknown_opmode_without_waiting() {
-        let (state, waiters) = deps();
-        let peer: SocketAddr = "127.0.0.1:20884".parse().unwrap();
-        state
-            .lock()
-            .unwrap()
-            .apply_event(&Event::Connected { peer });
-        state
-            .lock()
-            .unwrap()
-            .apply_event(&Event::OpModeList(vec![robocol::cmd::OpModeMeta {
-                name: "Duo (TeleOp)".into(),
-                flavor: "TELEOP".into(),
-                group: "drive".into(),
-            }]));
-        let client = unreachable_client();
+        let daemon = test_daemon(Duration::from_millis(50));
+        connected(&daemon);
+        with_opmodes(&daemon, &["Duo (TeleOp)"]);
         let reply = handle_request(
             Request::Init {
                 name: "Nonexistent".into(),
             },
-            &client,
-            &state,
-            &waiters,
-            Duration::from_millis(50),
+            &mut Session::new(),
+            &daemon,
         );
-        assert_eq!(reply["ok"], false);
         assert_eq!(reply["error"], "unknown_opmode");
     }
 
     #[test]
     fn list_resolves_once_the_matching_event_arrives() {
-        let (state, waiters) = deps();
-        let peer: SocketAddr = "127.0.0.1:20884".parse().unwrap();
-        state
-            .lock()
-            .unwrap()
-            .apply_event(&Event::Connected { peer });
-        let client = unreachable_client();
-
-        // Simulate the robot's reply landing on the waiter registry shortly
-        // after the request goes out, the way the real event-pump thread in
-        // `main.rs` does.
-        let waiters_bg = waiters.clone();
-        let (ready_tx, ready_rx) = mpsc::channel::<()>();
-        std::thread::spawn(move || {
-            ready_rx.recv().unwrap();
-            std::thread::sleep(Duration::from_millis(20));
-            waiters_bg.lock().unwrap().resolve(&Event::OpModeList(vec![
-                robocol::cmd::OpModeMeta {
-                    name: "Solo (TeleOp)".into(),
-                    flavor: "TELEOP".into(),
-                    group: "drive".into(),
-                },
-            ]));
-        });
-
-        // handle_request's `send` closure runs before recv_timeout blocks,
-        // so signal the background thread right as we call in.
-        ready_tx.send(()).unwrap();
-        let reply = handle_request(
-            Request::List,
-            &client,
-            &state,
-            &waiters,
-            Duration::from_secs(1),
+        let daemon = test_daemon(Duration::from_secs(1));
+        connected(&daemon);
+        answer(
+            &daemon,
+            vec![Event::OpModeList(vec![robocol::cmd::OpModeMeta {
+                name: "Solo (TeleOp)".into(),
+                flavor: "TELEOP".into(),
+                group: "drive".into(),
+            }])],
         );
+        let reply = handle_request(Request::List, &mut Session::new(), &daemon);
         assert_eq!(reply["ok"], true);
         assert_eq!(reply["opmodes"][0]["name"], "Solo (TeleOp)");
     }
 
     #[test]
-    fn gamepad_fails_fast_with_not_connected() {
-        let (state, waiters) = deps();
-        let client = unreachable_client();
-        let reply = handle_request(
-            Request::Gamepad(ds_proto::GamepadInput::default()),
-            &client,
-            &state,
-            &waiters,
-            Duration::from_millis(50),
+    fn init_ignores_a_stale_stop_robot_inited_event() {
+        // Mirrors `stop` then `init Foo`: the RC's late
+        // `NOTIFY_INIT_OP_MODE $Stop$Robot$` lands while the `init Foo`
+        // waiter is registered and must not resolve it.
+        let daemon = test_daemon(Duration::from_secs(1));
+        connected(&daemon);
+        with_opmodes(&daemon, &["Foo"]);
+        answer(
+            &daemon,
+            vec![
+                Event::OpModeInited(robocol::cmd::DEFAULT_OP_MODE.into()),
+                Event::OpModeInited("Foo".into()),
+            ],
         );
-        assert_eq!(reply["ok"], false);
-        assert_eq!(reply["error"], "not_connected");
+        let mut session = Session::new();
+        let reply = handle_request(Request::Init { name: "Foo".into() }, &mut session, &daemon);
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["name"], "Foo");
+        assert_eq!(session.last_inited.as_deref(), Some("Foo"));
     }
 
     #[test]
-    fn init_ignores_a_stale_stop_robot_inited_event() {
-        // Mirrors `ds_agent stop; ds_agent init Foo`: the RC's late
-        // `NOTIFY_INIT_OP_MODE $Stop$Robot$` lands while the `init Foo`
-        // waiter is registered and must not resolve it.
-        let (state, waiters) = deps();
-        let peer: SocketAddr = "127.0.0.1:20884".parse().unwrap();
-        state
-            .lock()
-            .unwrap()
-            .apply_event(&Event::Connected { peer });
-        state
-            .lock()
-            .unwrap()
-            .apply_event(&Event::OpModeList(vec![robocol::cmd::OpModeMeta {
-                name: "Foo".into(),
-                flavor: "TELEOP".into(),
-                group: "drive".into(),
-            }]));
-        let client = unreachable_client();
+    fn bare_run_ignores_another_connections_init() {
+        // Two clients: the first inits Foo; the second's bare `run` must not
+        // pick that up (review item 4).
+        let daemon = test_daemon(Duration::from_secs(1));
+        connected(&daemon);
+        with_opmodes(&daemon, &["Foo"]);
+        answer(&daemon, vec![Event::OpModeInited("Foo".into())]);
+        let mut first = Session::new();
+        let inited = handle_request(Request::Init { name: "Foo".into() }, &mut first, &daemon);
+        assert_eq!(inited["ok"], true);
 
-        let waiters_bg = waiters.clone();
-        let (ready_tx, ready_rx) = mpsc::channel::<()>();
-        std::thread::spawn(move || {
-            ready_rx.recv().unwrap();
-            std::thread::sleep(Duration::from_millis(20));
-            waiters_bg
-                .lock()
-                .unwrap()
-                .resolve(&Event::OpModeInited(robocol::cmd::DEFAULT_OP_MODE.into()));
-            std::thread::sleep(Duration::from_millis(50));
-            waiters_bg
-                .lock()
-                .unwrap()
-                .resolve(&Event::OpModeInited("Foo".into()));
-        });
+        let reply = handle_request(Request::Run { name: None }, &mut Session::new(), &daemon);
+        assert_eq!(reply["error"], "bad_args");
+        assert!(reply["message"].as_str().unwrap().contains("run <name>"));
+    }
 
-        ready_tx.send(()).unwrap();
-        let reply = handle_request(
-            Request::Init { name: "Foo".into() },
-            &client,
-            &state,
-            &waiters,
-            Duration::from_secs(1),
-        );
+    #[test]
+    fn bare_run_uses_this_sessions_init() {
+        let daemon = test_daemon(Duration::from_secs(1));
+        connected(&daemon);
+        with_opmodes(&daemon, &["Foo", "Bar"]);
+        answer(&daemon, vec![Event::OpModeRunning("Foo".into())]);
+        let mut session = Session::new();
+        session.last_inited = Some("Foo".into());
+        let reply = handle_request(Request::Run { name: None }, &mut session, &daemon);
         assert_eq!(reply["ok"], true);
         assert_eq!(reply["name"], "Foo");
     }
 
     #[test]
     fn list_times_out_when_nothing_resolves_it() {
-        let (state, waiters) = deps();
-        let peer: SocketAddr = "127.0.0.1:20884".parse().unwrap();
-        state
-            .lock()
-            .unwrap()
-            .apply_event(&Event::Connected { peer });
-        let client = unreachable_client();
-        let reply = handle_request(
-            Request::List,
-            &client,
-            &state,
-            &waiters,
-            Duration::from_millis(50),
-        );
-        assert_eq!(reply["ok"], false);
+        let daemon = test_daemon(Duration::from_millis(50));
+        connected(&daemon);
+        let reply = handle_request(Request::List, &mut Session::new(), &daemon);
         assert_eq!(reply["error"], "timeout");
     }
 
     #[test]
     fn timed_out_init_waiter_is_unregistered() {
-        let (state, waiters) = deps();
-        let peer: SocketAddr = "127.0.0.1:20884".parse().unwrap();
-        state
-            .lock()
-            .unwrap()
-            .apply_event(&Event::Connected { peer });
-        let client = unreachable_client();
+        let daemon = test_daemon(Duration::from_millis(50));
+        connected(&daemon);
         let reply = handle_request(
             Request::Init {
                 name: "Never".into(),
             },
-            &client,
-            &state,
-            &waiters,
-            Duration::from_millis(50),
+            &mut Session::new(),
+            &daemon,
         );
         assert_eq!(reply["error"], "timeout");
         // A name-matched waiter would otherwise linger until an
         // `OpModeInited("Never")` that may never arrive.
-        assert_eq!(waiters.lock().unwrap().len(), 0);
+        assert_eq!(daemon.waiters().len(), 0);
     }
 }

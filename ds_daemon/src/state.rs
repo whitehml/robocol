@@ -15,9 +15,6 @@ pub struct DaemonState {
     pub peer: Option<String>,
     pub robot_state: Option<RobotState>,
     pub opmodes: Vec<OpModeMeta>,
-    /// Name most recently confirmed by `Event::OpModeInited`, so `run` with
-    /// no argument can fall back to it the way `ds_cli`'s REPL session does.
-    pub last_inited: Option<String>,
     pub active_config: Option<String>,
     pub configs: Vec<ConfigMeta>,
     pub device_types: Option<String>,
@@ -38,7 +35,6 @@ impl DaemonState {
             peer: None,
             robot_state: None,
             opmodes: Vec::new(),
-            last_inited: None,
             active_config: None,
             configs: Vec::new(),
             device_types: None,
@@ -61,12 +57,6 @@ impl DaemonState {
             }
             Event::RobotState(state) => self.robot_state = Some(*state),
             Event::OpModeList(list) => self.opmodes = list.clone(),
-            // The RC reports `$Stop$Robot$` inited whenever an opmode ends;
-            // that is not a user choice, so a bare `run` after `stop` still
-            // targets the last real opmode.
-            Event::OpModeInited(name) if name != robocol::cmd::DEFAULT_OP_MODE => {
-                self.last_inited = Some(name.clone())
-            }
             Event::ActiveConfiguration(extra) => self.active_config = Some(extra.clone()),
             Event::ConfigurationList(extra) => self.configs = parse_config_list(extra),
             Event::UserDeviceList(extra) => self.device_types = Some(extra.clone()),
@@ -119,7 +109,6 @@ impl DaemonState {
             "peer": self.peer,
             "robot_state": self.robot_state.map(|s| format!("{s:?}")),
             "opmodes": opmodes,
-            "last_inited": self.last_inited,
             "active_config": self.active_config,
             "configs": self.configs,
             "device_types": self.device_types,
@@ -169,30 +158,6 @@ mod tests {
         }]));
         assert!(state.find_opmode("Duo (TeleOp)"));
         assert!(!state.find_opmode("Nonexistent"));
-    }
-
-    #[test]
-    fn opmode_inited_sets_last_inited() {
-        let mut state = DaemonState::new();
-        state.apply_event(&Event::OpModeInited("Duo (TeleOp)".into()));
-        assert_eq!(state.last_inited.as_deref(), Some("Duo (TeleOp)"));
-    }
-
-    #[test]
-    fn stop_robot_inited_does_not_overwrite_last_inited() {
-        let mut state = DaemonState::new();
-        state.apply_event(&Event::OpModeInited("Duo (TeleOp)".into()));
-        state.apply_event(&Event::OpModeInited(
-            robocol::cmd::DEFAULT_OP_MODE.to_string(),
-        ));
-        assert_eq!(state.last_inited.as_deref(), Some("Duo (TeleOp)"));
-
-        // And it never becomes the fallback on its own either.
-        let mut fresh = DaemonState::new();
-        fresh.apply_event(&Event::OpModeInited(
-            robocol::cmd::DEFAULT_OP_MODE.to_string(),
-        ));
-        assert_eq!(fresh.last_inited, None);
     }
 
     #[test]

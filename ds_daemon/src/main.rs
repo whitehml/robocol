@@ -11,14 +11,13 @@ mod watch;
 
 use std::net::IpAddr;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use robocol::{ClientConfig, RobocolClient};
 
 use connection::handle_connection;
-use state::DaemonState;
-use waiters::{Subscribers, WaiterRegistry};
+use dispatch::Daemon;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -116,27 +115,25 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let client = Arc::new(Mutex::new(client));
-    let state = Arc::new(Mutex::new(DaemonState::new()));
-    let waiters = Arc::new(Mutex::new(WaiterRegistry::new()));
-    let subscribers = Arc::new(Mutex::new(Subscribers::new()));
+    let daemon = Arc::new(Daemon::new(client, resolve_timeout()));
 
     {
-        let state = state.clone();
-        let waiters = waiters.clone();
-        let subscribers = subscribers.clone();
+        let daemon = daemon.clone();
         std::thread::spawn(move || {
             for event in events {
-                state
+                daemon
+                    .state
                     .lock()
                     .expect("state mutex poisoned")
                     .apply_event(&event);
-                waiters
+                daemon
+                    .waiters
                     .lock()
                     .expect("waiters mutex poisoned")
                     .resolve(&event);
                 if let Some(line) = watch::watch_json(&event) {
-                    subscribers
+                    daemon
+                        .subscribers
                         .lock()
                         .expect("subscribers mutex poisoned")
                         .broadcast(&line);
@@ -150,15 +147,9 @@ fn main() {
         });
     }
 
-    let timeout = resolve_timeout();
     for incoming in listener.incoming() {
         let Ok(stream) = incoming else { continue };
-        let client = client.clone();
-        let state = state.clone();
-        let waiters = waiters.clone();
-        let subscribers = subscribers.clone();
-        std::thread::spawn(move || {
-            handle_connection(stream, client, state, waiters, subscribers, timeout);
-        });
+        let daemon = daemon.clone();
+        std::thread::spawn(move || handle_connection(stream, daemon));
     }
 }

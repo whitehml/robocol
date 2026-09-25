@@ -94,11 +94,23 @@ impl GamepadInput {
     }
 }
 
+/// Who is on the other end of a connection. A coordination seam, not access
+/// control: `ds_cli` says `operator`, `ds_agent` says `agent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Operator,
+    Agent,
+}
+
 /// One request from a front end to `ds_daemon`, as it travels on the wire:
 /// `{"cmd": "<verb>", ...fields}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "kebab-case")]
 pub enum Request {
+    Hello {
+        role: Role,
+    },
     Ping,
     Status,
     List,
@@ -141,6 +153,7 @@ impl Request {
     /// test then checks that verb is in `PARSE_TABLE`.
     pub fn verb(&self) -> &'static str {
         match self {
+            Request::Hello { .. } => "hello",
             Request::Ping => "ping",
             Request::Status => "status",
             Request::List => "list",
@@ -183,6 +196,18 @@ pub struct Verb {
 /// Every verb either front end accepts, and how to parse it. The only place
 /// verbs are defined: `ds_cli` and `ds_agent` both go through `parse`.
 pub const PARSE_TABLE: &[Verb] = &[
+    Verb {
+        name: "hello",
+        usage: "hello operator|agent",
+        parse: |a| match a {
+            [role] => Ok(Request::Hello {
+                role: parse_role(role)?,
+            }),
+            _ => Err("usage: hello operator|agent".into()),
+        },
+        example: &["agent"],
+        text_arg: false,
+    },
     Verb {
         name: "ping",
         usage: "ping",
@@ -428,6 +453,14 @@ fn split_words(s: &str) -> Result<Vec<String>, String> {
     Ok(words)
 }
 
+fn parse_role(word: &str) -> Result<Role, String> {
+    match word {
+        "operator" => Ok(Role::Operator),
+        "agent" => Ok(Role::Agent),
+        other => Err(format!("expected operator or agent, got {other:?}")),
+    }
+}
+
 fn no_args(verb: &str, args: &[&str], request: Request) -> Result<Request, String> {
     if args.is_empty() {
         Ok(request)
@@ -566,6 +599,22 @@ mod tests {
         assert!(parse(&[]).is_err());
         let err = parse(&["fly"]).unwrap_err();
         assert!(err.contains("help"), "{err}");
+    }
+
+    #[test]
+    fn hello_takes_exactly_one_known_role() {
+        assert_eq!(
+            parse(&["hello", "operator"]),
+            Ok(Request::Hello {
+                role: Role::Operator
+            })
+        );
+        assert!(parse(&["hello"]).is_err());
+        assert!(parse(&["hello", "admin"]).is_err());
+        assert_eq!(
+            serde_json::to_value(Request::Hello { role: Role::Agent }).unwrap(),
+            json!({"cmd": "hello", "role": "agent"})
+        );
     }
 
     #[test]

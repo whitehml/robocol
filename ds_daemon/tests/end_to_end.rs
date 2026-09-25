@@ -151,7 +151,11 @@ fn drives_an_opmode_and_watches_telemetry_against_fake_rc() {
     assert_eq!(init["ok"], true);
     assert_eq!(init["name"], "Duo (TeleOp)");
 
-    let run = run_agent(&tmp, &["run"]); // no name: falls back to last_inited
+    // Each ds_agent call is its own connection, so a bare `run` has no
+    // `init` to fall back on and must name the opmode.
+    let bare = run_agent(&tmp, &["run"]);
+    assert_eq!(bare["error"], "bad_args", "bare run: {bare}");
+    let run = run_agent(&tmp, &["run", "Duo (TeleOp)"]);
     assert_eq!(run["ok"], true);
     assert_eq!(run["name"], "Duo (TeleOp)");
 

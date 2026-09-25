@@ -6,7 +6,7 @@ pub mod filter;
 pub mod request;
 
 pub use filter::WatchFilter;
-pub use request::{GamepadInput, PARSE_TABLE, Request, Verb, parse, split_line};
+pub use request::{GamepadInput, PARSE_TABLE, Request, Role, Verb, parse, split_line};
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
