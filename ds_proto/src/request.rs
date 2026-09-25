@@ -195,8 +195,10 @@ pub enum Request {
 
 impl Request {
     /// The CLI verb for this request. The match is exhaustive on purpose: a
-    /// new variant does not compile until it is given a verb, and the parity
-    /// test then checks that verb is in `PARSE_TABLE`.
+    /// new variant does not compile until it is given a verb. The parity
+    /// test then checks every `PARSE_TABLE` row parses to the variant with
+    /// its verb; it cannot see a variant that has no row at all, which is
+    /// then reachable from no front end.
     pub fn verb(&self) -> &'static str {
         match self {
             Request::Hello { .. } => "hello",

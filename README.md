@@ -98,34 +98,53 @@ Errors look like `{"ok":false,"error":"<code>","message":"..."}`.
 
 Claim a gamepad before sending to it. `ds_cli` is the operator and
 `ds_agent` is the agent. The operator's claim always wins and cuts the agent
-off; the agent is told `preempted`. Every claim and release first sends the
-pad a neutral packet, so nobody takes over a pushed stick; claiming again is
-how to clear a stuck one.
+off; the agent is told `preempted`. The operator's pads come back when it
+releases them or its last `ds_cli` quits.
 
 Each `gamepad` command is a pulse: the input is sent 50 times a second for
-`--duration` (default 300 ms, at most 10 s), then the pad returns to neutral.
+`--duration` (default 300 ms, at most 10 s, at least 3 packets), then the pad
+returns to neutral. A pulse stops early, back at neutral, when the operator
+takes the pad or the command that asked for it is interrupted.
+
+Gamepad packets are not acknowledged, so every way back to rest (a pulse
+ending, a claim, a release) sends a burst of neutral packets, not one.
+Nobody takes over a pushed stick, and claiming again clears a stuck one.
+
+### Watching
+
+`watch` prints one line per event: `connected`, `disconnected`,
+`peer_busy`, `state`, `telemetry`, `opmode_inited`, `opmode_running`,
+`command`, `stacktrace`, `command_dropped`, `protocol_error`,
+`webcam_available`, `gamepad_owner`. `status` has the latest of everything,
+including the current `opmode` and who holds each gamepad.
 
 ### Errors
 
 | error | meaning | what to do |
 |---|---|---|
-| `not_connected` | no Robot Controller found yet | join its Wi-Fi; check `status` |
+| `not_connected` | no Robot Controller found yet, or `disconnect` was run | join its Wi-Fi and check `status`; after `disconnect`, run `connect` |
 | `peer_busy` | another driver station owns the RC | close it, then run `connect` |
-| `preempted` | the operator holds that gamepad | wait for `release` |
+| `preempted` | the operator holds that gamepad | wait until it releases it or quits `ds_cli` |
 | `not_claimed` | you have not claimed that gamepad | run `claim gamepad1` |
-| `daemon_unreachable` | the daemon is not running and could not start | read the message; the log is next to the socket |
+| `daemon_unreachable` | the daemon is not running and could not start | read the message; it quotes the daemon's log |
 | `timeout` | the RC did not answer in time | check `status`, try again |
+| `bad_args` | the command or its arguments are wrong | check the usage `ds_agent` prints, or `help` in `ds_cli` |
 
 Other commands: `connect`, `disconnect`, `ping` (is a daemon running? never
-starts one), `shutdown` (stop the daemon).
+starts one), `shutdown` (stop the daemon; pads it holds go back to neutral).
+
+The daemon keeps running across rebuilds: after rebuilding, run
+`ds_agent shutdown` so the next command starts the new one.
 
 | variable | effect |
 |---|---|
 | `DS_DAEMON_ARGS` | extra flags for a daemon that a front end starts, e.g. `--peer 10.0.0.5` |
 | `DS_DAEMON_TIMEOUT_MS` | how long the daemon waits for the RC to answer (default 5000) |
 
-The socket is `$XDG_RUNTIME_DIR/ds_daemon.sock`, or `/tmp/ds_daemon-<uid>.sock`
-without it. The daemon's log is the same path ending in `.log`.
+The socket is `$XDG_RUNTIME_DIR/ds_daemon.sock`; on macOS, which has no
+`XDG_RUNTIME_DIR`, `$TMPDIR/ds_daemon.sock`; otherwise
+`/tmp/ds_daemon-<uid>.sock`. The daemon's log is the same path ending in
+`.log`.
 
 ## Lint
 
