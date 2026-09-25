@@ -167,12 +167,17 @@ pub fn connect_or_spawn(role: Role, extra_args: &[String]) -> Result<Connection,
     }
 }
 
-/// If the started daemon has exited (checking for up to `grace`), why: its
-/// exit status and the end of its log.
+/// If the started daemon has failed (checking for up to `grace`), why: its
+/// exit status and the end of its log. A clean exit is not a failure: it
+/// means another daemon took the instance lock first, and that one is the
+/// daemon to wait for.
 fn exit_report(child: &mut Child, grace: Duration) -> Option<String> {
     let deadline = Instant::now() + grace;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
+            if status.success() {
+                return None;
+            }
             return Some(format!(
                 "ds_daemon exited ({status}) before it was ready; end of {}:\n{}",
                 log_path().display(),

@@ -107,6 +107,28 @@ impl Daemon {
         }
     }
 
+    /// Stops the daemon for `shutdown`: returns every held pad to neutral,
+    /// removes the socket, and exits. The arbiter lock is kept from here on,
+    /// so no pulse can send another packet.
+    pub fn shut_down(&self) -> ! {
+        let arbiter = self.gamepads();
+        let held: Vec<Pad> = Pad::ALL
+            .into_iter()
+            .filter(|pad| arbiter.owner(*pad).is_some())
+            .collect();
+        for _ in 0..gamepad::TAIL_PACKETS {
+            for &pad in &held {
+                self.send_gamepad(&gamepad::neutral(pad));
+            }
+            std::thread::sleep(Duration::from_millis(gamepad::PULSE_PERIOD_MS));
+        }
+        let _ = std::fs::remove_file(ds_proto::socket_path());
+        // robocol sends from its own thread: give it a moment to put the
+        // last packets on the wire.
+        std::thread::sleep(Duration::from_millis(50));
+        std::process::exit(0);
+    }
+
     /// Called by the connection layer once a session is over: its client
     /// hung up, or the connection became a `watch` stream.
     pub fn end_session(&self, session: &Session) {
@@ -175,6 +197,10 @@ fn ensure_connected(daemon: &Daemon) -> Result<(), Value> {
         Some(peer) => err(
             "peer_busy",
             format!("{peer} is connected to another driver station; close it, then run `connect`"),
+        ),
+        None if state.paused => err(
+            "not_connected",
+            "disconnected by `disconnect`; run `connect` to reconnect",
         ),
         None => err("not_connected", "robot controller not connected yet"),
     })
@@ -398,11 +424,16 @@ pub fn handle_request(request: Request, session: &mut Session, daemon: &Daemon) 
             }
         }
         Request::Connect => {
-            daemon.state().peer_busy = None;
+            {
+                let mut state = daemon.state();
+                state.peer_busy = None;
+                state.paused = false;
+            }
             daemon.client().connect();
             json!({"ok": true})
         }
         Request::Disconnect => {
+            daemon.state().paused = true;
             daemon.client().disconnect();
             json!({"ok": true})
         }
@@ -583,10 +614,21 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_needs_no_rc() {
+    fn disconnect_needs_no_rc_and_says_how_to_undo_it() {
         let daemon = test_daemon(Duration::from_millis(50));
         let reply = handle_request(Request::Disconnect, &mut Session::new(), &daemon);
         assert_eq!(reply, json!({"ok": true}));
+        let status = handle_request(Request::Status, &mut Session::new(), &daemon);
+        assert_eq!(status["paused"], true);
+        let list = handle_request(Request::List, &mut Session::new(), &daemon);
+        assert!(
+            list["message"].as_str().unwrap().contains("run `connect`"),
+            "{list}"
+        );
+
+        handle_request(Request::Connect, &mut Session::new(), &daemon);
+        let status = handle_request(Request::Status, &mut Session::new(), &daemon);
+        assert_eq!(status["paused"], false);
     }
 
     #[test]

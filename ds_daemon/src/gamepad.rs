@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 /// Milliseconds between the packets of a pulse or a neutral burst: 50 Hz,
 /// as Deck Station sends.
-const PULSE_PERIOD_MS: u64 = 20;
+pub const PULSE_PERIOD_MS: u64 = 20;
 /// Pulse length when a `gamepad` request names none.
 pub const DEFAULT_PULSE_MS: u64 = 300;
 /// The longest pulse one request may ask for.

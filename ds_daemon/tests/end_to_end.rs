@@ -863,3 +863,41 @@ fn gamepad_handovers_survive_packet_loss() {
     shut_down(&tmp, &mut daemon);
     let _ = fake_rc.0.kill();
 }
+
+#[test]
+fn a_second_daemon_leaves_the_first_alone() {
+    build_bins(&["ds_agent"]);
+
+    let tmp = tempdir("twice_");
+    // Port 1: nothing answers, so no fake_rc is needed.
+    let mut first = start_daemon(&tmp, 1);
+    let mut second = Command::new(bin_path("ds_daemon"));
+    second
+        .args([
+            "--peer",
+            "127.0.0.1",
+            "--peer-port",
+            "1",
+            "--bind-port",
+            "0",
+        ])
+        .env("XDG_RUNTIME_DIR", &tmp);
+    let output = output_within(second, LAUNCH_LIMIT);
+    assert!(
+        output.status.success(),
+        "the second daemon: {}",
+        output.status
+    );
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        said.contains("already running"),
+        "the second daemon said: {said}"
+    );
+
+    assert_eq!(run_agent(&tmp, &["ping"])["running"], true);
+    shut_down(&tmp, &mut first);
+    assert!(
+        !tmp.join("ds_daemon.sock").exists(),
+        "shutdown left the socket behind"
+    );
+}

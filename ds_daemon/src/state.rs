@@ -16,6 +16,9 @@ pub struct DaemonState {
     /// The RC that answered discovery as already owned by another driver
     /// station. Discovery stays paused until a `connect` request.
     pub peer_busy: Option<String>,
+    /// Discovery was stopped by `disconnect`, and stays stopped until
+    /// `connect`.
+    pub paused: bool,
     /// The opmode inited or running on the RC; `None` once it stops
     /// (`$Stop$Robot$` is inited) or the RC goes away.
     pub opmode: Option<String>,
@@ -40,6 +43,7 @@ impl DaemonState {
             connected: false,
             peer: None,
             peer_busy: None,
+            paused: false,
             opmode: None,
             robot_state: None,
             opmodes: Vec::new(),
@@ -113,6 +117,7 @@ impl DaemonState {
             "connected": self.connected,
             "peer": self.peer,
             "peer_busy": self.peer_busy,
+            "paused": self.paused,
             "opmode": self.opmode,
             "robot_state": self.robot_state.map(|s| format!("{s:?}")),
             "opmodes": opmodes,

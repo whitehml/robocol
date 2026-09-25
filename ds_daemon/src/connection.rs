@@ -76,7 +76,7 @@ pub fn handle_connection(stream: UnixStream, daemon: Arc<Daemon>) {
             }
             Ok(Request::Shutdown) => {
                 let _ = ds_proto::write_message(&mut writer, &json!({"ok": true}));
-                std::process::exit(0);
+                daemon.shut_down();
             }
             Ok(request) => handle_request(request, &mut session, &daemon),
             Err(e) => json!({"ok": false, "error": "bad_args", "message": e.to_string()}),
