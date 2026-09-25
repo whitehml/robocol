@@ -12,6 +12,7 @@
 //! ```sh
 //! cargo run -p fake_rc              # binds 127.0.0.1:20884
 //! cargo run -p fake_rc 20900        # custom port
+//! FAKE_RC_BUSY=10 cargo run -p fake_rc   # held by a phantom DS for 10 s
 //! ```
 //! Point the Godot client at it with:
 //! `DECK_DS_PEER=127.0.0.1 DECK_DS_BIND_PORT=0 godot4 --path godot`
@@ -27,12 +28,13 @@ use jpeg_encoder::{ColorType, Encoder};
 use robocol::ROBOCOL_PORT;
 use robocol::cmd::{self, ConfigMeta};
 use robocol::packets::{
-    BATTERY_LEVEL_KEY, Command, Packet, PeerDiscovery, RC_BATTERY_STATUS_KEY, SYSTEM_KEY_PREFIX,
-    Telemetry,
+    BATTERY_LEVEL_KEY, Command, Packet, PeerDiscovery, PeerType, RC_BATTERY_STATUS_KEY,
+    SYSTEM_KEY_PREFIX, Telemetry,
 };
 use robocol::types::RobotState;
 
 const LIMELIGHT_PORT: u16 = 5800;
+const DS_TIMEOUT: Duration = Duration::from_secs(3);
 const CAM_WIDTH: u16 = 320;
 const CAM_HEIGHT: u16 = 240;
 const CAM_FRAME_INTERVAL: Duration = Duration::from_millis(83);
@@ -118,6 +120,8 @@ const USER_DEVICE_TYPES: &str = r#"[
 struct FakeRc {
     socket: UdpSocket,
     ds: Option<SocketAddr>,
+    ds_seen: Instant,
+    phantom_until: Option<Instant>,
     state: RobotState,
     opmode: String,
     alliance: &'static str,
@@ -130,10 +134,10 @@ struct FakeRc {
     run_started: Option<Instant>,
     configs: Vec<ConfigMeta>,
     active_config: ConfigMeta,
-    /// Device XML saved per config name, served back on a particular-config
+    /// Device XML saved per config (location, name), served back on a particular-config
     /// request so editor round-trips work; unsaved configs fall back to
     /// FAKE_CONFIG_XML.
-    saved_xml: HashMap<String, String>,
+    saved_xml: HashMap<(String, String), String>,
     next_resource_id: i64,
     /// Set by CMD_ACTIVATE_CONFIGURATION, applied on the restart that
     /// follows — matches real hardware, where activation only takes
@@ -143,7 +147,18 @@ struct FakeRc {
     webcam_frame_num: i32,
 }
 
+fn config_key(meta: &ConfigMeta) -> (String, String) {
+    (meta.location.clone(), meta.name.clone())
+}
+
 impl FakeRc {
+    fn held_against(&self, from: SocketAddr) -> bool {
+        self.phantom_until.is_some_and(|t| Instant::now() < t)
+            || self
+                .ds
+                .is_some_and(|ds| ds != from && self.ds_seen.elapsed() < DS_TIMEOUT)
+    }
+
     fn next_seq(&mut self) -> u16 {
         self.seq = self.seq.wrapping_add(1);
         self.seq
@@ -218,7 +233,7 @@ impl FakeRc {
             cmd::REQUEST_PARTICULAR_CONFIGURATION => {
                 let xml = serde_json::from_str::<ConfigMeta>(&command.extra)
                     .ok()
-                    .and_then(|meta| self.saved_xml.get(&meta.name).cloned())
+                    .and_then(|meta| self.saved_xml.get(&config_key(&meta)).cloned())
                     .unwrap_or_else(|| FAKE_CONFIG_XML.to_string());
                 self.send_command(cmd::REQUEST_PARTICULAR_CONFIGURATION_RESP, &xml);
             }
@@ -245,8 +260,12 @@ impl FakeRc {
                     self.next_resource_id += 1;
                     meta.resource_id = self.next_resource_id;
                 }
-                self.saved_xml.insert(meta.name.clone(), xml.to_string());
-                match self.configs.iter_mut().find(|c| c.name == meta.name) {
+                self.saved_xml.insert(config_key(&meta), xml.to_string());
+                match self
+                    .configs
+                    .iter_mut()
+                    .find(|c| config_key(c) == config_key(&meta))
+                {
                     Some(existing) => *existing = meta.clone(),
                     None => self.configs.push(meta.clone()),
                 }
@@ -261,7 +280,7 @@ impl FakeRc {
             }
             cmd::DELETE_CONFIGURATION => {
                 if let Ok(meta) = serde_json::from_str::<ConfigMeta>(&command.extra) {
-                    self.configs.retain(|c| c.name != meta.name);
+                    self.configs.retain(|c| config_key(c) != config_key(&meta));
                 }
             }
             _ => {}
@@ -586,6 +605,10 @@ fn main() {
     let mut rc = FakeRc {
         socket,
         ds: None,
+        ds_seen: Instant::now(),
+        phantom_until: std::env::var("FAKE_RC_BUSY").ok().map(|s| {
+            Instant::now() + Duration::from_secs(s.parse().expect("invalid FAKE_RC_BUSY"))
+        }),
         state: RobotState::NotStarted,
         opmode: String::new(),
         alliance: "RED",
@@ -629,51 +652,64 @@ fn main() {
     let mut last_rc_battery = Instant::now();
     loop {
         match rc.socket.recv_from(&mut buf) {
-            Ok((n, from)) => match Packet::parse(&buf[..n]) {
-                Ok(Packet::PeerDiscovery(_)) => {
-                    if rc.ds != Some(from) {
-                        println!("DS connected: {from}");
-                        rc.ds = Some(from);
+            Ok((n, from)) => {
+                if rc.ds == Some(from) {
+                    rc.ds_seen = Instant::now();
+                }
+                match Packet::parse(&buf[..n]) {
+                    Ok(Packet::PeerDiscovery(_)) if rc.held_against(from) => {
+                        println!("!! refusing {from}: already connected to another DS");
+                        let reply = PeerDiscovery {
+                            peer_type: PeerType::NotConnectedDueToPreexistingConnection,
+                            ..Default::default()
+                        };
+                        let _ = rc.socket.send_to(&reply.serialize(), from);
                     }
-                    let reply = PeerDiscovery::default().serialize();
-                    let _ = rc.socket.send_to(&reply, from);
-                }
-                Ok(Packet::Heartbeat(mut hb)) if rc.ds == Some(from) => {
-                    // Echo with our state, like the real RC.
-                    hb.robot_state = rc.state;
-                    hb.seq = rc.next_seq();
-                    let _ = rc.socket.send_to(&hb.serialize(), from);
-                }
-                Ok(Packet::Command(c)) if rc.ds == Some(from) => rc.handle_command(c),
-                Ok(Packet::Heartbeat(_) | Packet::Command(_)) => {
-                    println!("!! ignoring {from}: not the connected DS ({:?})", rc.ds);
-                }
-                Ok(Packet::Gamepad(gp)) if gp.user == 1 => {
-                    if gp.left_stick_y != rc.left_stick_y {
-                        println!("gamepad{} left_stick_y={}", gp.user, gp.left_stick_y);
-                    }
-                    rc.left_stick_y = gp.left_stick_y;
-                    if rc.state == RobotState::Init {
-                        if gp.x && !rc.prev_x {
-                            rc.alliance = if rc.alliance == "RED" { "BLUE" } else { "RED" };
-                            println!("gamepad{} X: alliance -> {}", gp.user, rc.alliance);
+                    Ok(Packet::PeerDiscovery(_)) => {
+                        if rc.ds != Some(from) {
+                            println!("DS connected: {from}");
+                            rc.ds = Some(from);
                         }
-                        if gp.y && !rc.prev_y {
-                            rc.start_position = if rc.start_position == "LEFT" {
-                                "RIGHT"
-                            } else {
-                                "LEFT"
-                            };
-                            println!("gamepad{} Y: start -> {}", gp.user, rc.start_position);
-                        }
+                        let reply = PeerDiscovery::default().serialize();
+                        let _ = rc.socket.send_to(&reply, from);
                     }
-                    rc.prev_x = gp.x;
-                    rc.prev_y = gp.y;
+                    Ok(Packet::Heartbeat(mut hb)) if rc.ds == Some(from) => {
+                        // Echo with our state, like the real RC.
+                        hb.robot_state = rc.state;
+                        hb.seq = rc.next_seq();
+                        let _ = rc.socket.send_to(&hb.serialize(), from);
+                    }
+                    Ok(Packet::Command(c)) if rc.ds == Some(from) => rc.handle_command(c),
+                    Ok(Packet::Heartbeat(_) | Packet::Command(_)) => {
+                        println!("!! ignoring {from}: not the connected DS ({:?})", rc.ds);
+                    }
+                    Ok(Packet::Gamepad(gp)) if gp.user == 1 => {
+                        if gp.left_stick_y != rc.left_stick_y {
+                            println!("gamepad{} left_stick_y={}", gp.user, gp.left_stick_y);
+                        }
+                        rc.left_stick_y = gp.left_stick_y;
+                        if rc.state == RobotState::Init {
+                            if gp.x && !rc.prev_x {
+                                rc.alliance = if rc.alliance == "RED" { "BLUE" } else { "RED" };
+                                println!("gamepad{} X: alliance -> {}", gp.user, rc.alliance);
+                            }
+                            if gp.y && !rc.prev_y {
+                                rc.start_position = if rc.start_position == "LEFT" {
+                                    "RIGHT"
+                                } else {
+                                    "LEFT"
+                                };
+                                println!("gamepad{} Y: start -> {}", gp.user, rc.start_position);
+                            }
+                        }
+                        rc.prev_x = gp.x;
+                        rc.prev_y = gp.y;
+                    }
+                    Ok(Packet::Gamepad(_)) => {}
+                    Ok(_) => {}
+                    Err(e) => println!("!! parse error: {e}"),
                 }
-                Ok(Packet::Gamepad(_)) => {}
-                Ok(_) => {}
-                Err(e) => println!("!! parse error: {e}"),
-            },
+            }
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut => {}
