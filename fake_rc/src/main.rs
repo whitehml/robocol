@@ -2,8 +2,10 @@
 //!
 //! Answers discovery, serves an OpMode list, echoes INIT/RUN notifies,
 //! streams telemetry at 10 Hz, and implements an interactive INIT-phase
-//! pattern: pressing gamepad X toggles alliance, Y toggles start position,
-//! echoed back through telemetry.
+//! pattern: pressing gamepad1 X toggles alliance, Y toggles start position,
+//! echoed back through telemetry. Whatever it last received on gamepad1 and
+//! gamepad2 is echoed too (`gamepad1_left_stick_y`, `gamepad2_a`, ...), so a
+//! client can see what the "robot" actually got.
 //!
 //! It also runs an always-on Limelight MJPEG-over-HTTP stand-in on :5800, and
 //! emulates the RC webcam's Robocol-native `CameraStreamServer` protocol
@@ -13,6 +15,7 @@
 //! cargo run -p fake_rc              # binds 127.0.0.1:20884
 //! cargo run -p fake_rc 20900        # custom port
 //! FAKE_RC_BUSY=10 cargo run -p fake_rc   # held by a phantom DS for 10 s
+//! FAKE_RC_GAMEPAD_LOSS=0.5 cargo run -p fake_rc   # drop half the gamepad packets
 //! ```
 //! Point the Godot client at it with:
 //! `DECK_DS_PEER=127.0.0.1 DECK_DS_BIND_PORT=0 godot4 --path godot`
@@ -22,13 +25,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use jpeg_encoder::{ColorType, Encoder};
 use robocol::ROBOCOL_PORT;
 use robocol::cmd::{self, ConfigMeta};
 use robocol::packets::{
-    BATTERY_LEVEL_KEY, Command, Packet, PeerDiscovery, PeerType, RC_BATTERY_STATUS_KEY,
+    BATTERY_LEVEL_KEY, Command, Gamepad, Packet, PeerDiscovery, PeerType, RC_BATTERY_STATUS_KEY,
     SYSTEM_KEY_PREFIX, Telemetry,
 };
 use robocol::types::RobotState;
@@ -117,6 +120,15 @@ const USER_DEVICE_TYPES: &str = r#"[
     {"xmlTag":"Webcam","name":"Webcam","flavor":"BUILT_IN"}
 ]"#;
 
+/// What the fake RC last received on one gamepad slot.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct PadState {
+    left_stick_y: f32,
+    a: bool,
+    x: bool,
+    y: bool,
+}
+
 struct FakeRc {
     socket: UdpSocket,
     ds: Option<SocketAddr>,
@@ -126,9 +138,12 @@ struct FakeRc {
     opmode: String,
     alliance: &'static str,
     start_position: &'static str,
-    prev_x: bool,
-    prev_y: bool,
-    left_stick_y: f32,
+    /// gamepad1 and gamepad2, by `user - 1`.
+    pads: [PadState; 2],
+    /// Fraction of received gamepad packets to drop (`FAKE_RC_GAMEPAD_LOSS`).
+    gamepad_loss: f32,
+    /// xorshift32 state for `gamepad_loss`.
+    rng: u32,
     seq: u16,
     started: Instant,
     run_started: Option<Instant>,
@@ -152,6 +167,109 @@ fn config_key(meta: &ConfigMeta) -> (String, String) {
 }
 
 impl FakeRc {
+    fn new(socket: UdpSocket) -> FakeRc {
+        FakeRc {
+            socket,
+            ds: None,
+            ds_seen: Instant::now(),
+            phantom_until: None,
+            state: RobotState::NotStarted,
+            opmode: String::new(),
+            alliance: "RED",
+            start_position: "LEFT",
+            pads: [PadState::default(); 2],
+            gamepad_loss: 0.0,
+            rng: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(1)
+                | 1,
+            seq: 0,
+            started: Instant::now(),
+            run_started: None,
+            configs: vec![
+                ConfigMeta {
+                    is_dirty: false,
+                    location: "LOCAL_STORAGE".to_string(),
+                    name: "practice_bot".to_string(),
+                    resource_id: 1,
+                },
+                // An immutable built-in, to exercise the copy-only (Save As) path.
+                ConfigMeta {
+                    is_dirty: false,
+                    location: "RESOURCE".to_string(),
+                    name: "goBILDA Starter Bot".to_string(),
+                    resource_id: 2132017159,
+                },
+            ],
+            active_config: ConfigMeta {
+                is_dirty: false,
+                location: "NONE".to_string(),
+                name: "<No Config Set>".to_string(),
+                resource_id: 0,
+            },
+            saved_xml: HashMap::new(),
+            next_resource_id: 1,
+            pending_activation: None,
+            webcam_available: false,
+            webcam_frame_num: 0,
+        }
+    }
+
+    /// Applies one received gamepad packet: remembers what `user` 1 or 2 sent
+    /// (other users are ignored), and during INIT turns a fresh gamepad1 X
+    /// or Y press into an alliance or start-position toggle.
+    fn handle_gamepad(&mut self, gp: &Gamepad) {
+        let slot = match gp.user {
+            1 => 0,
+            2 => 1,
+            _ => return,
+        };
+        if self.drop_gamepad() {
+            return;
+        }
+        let prev = self.pads[slot];
+        if gp.left_stick_y != prev.left_stick_y {
+            println!("gamepad{} left_stick_y={}", gp.user, gp.left_stick_y);
+        }
+        if gp.user == 1 && self.state == RobotState::Init {
+            if gp.x && !prev.x {
+                self.alliance = if self.alliance == "RED" {
+                    "BLUE"
+                } else {
+                    "RED"
+                };
+                println!("gamepad1 X: alliance -> {}", self.alliance);
+            }
+            if gp.y && !prev.y {
+                self.start_position = if self.start_position == "LEFT" {
+                    "RIGHT"
+                } else {
+                    "LEFT"
+                };
+                println!("gamepad1 Y: start -> {}", self.start_position);
+            }
+        }
+        self.pads[slot] = PadState {
+            left_stick_y: gp.left_stick_y,
+            a: gp.a,
+            x: gp.x,
+            y: gp.y,
+        };
+    }
+
+    /// True for the fraction `gamepad_loss` of calls (xorshift32: a test
+    /// knob needs no RNG dependency).
+    fn drop_gamepad(&mut self) -> bool {
+        if self.gamepad_loss <= 0.0 {
+            return false;
+        }
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 17;
+        self.rng ^= self.rng << 5;
+        (self.rng as f32 / u32::MAX as f32) < self.gamepad_loss
+    }
+
     fn held_against(&self, from: SocketAddr) -> bool {
         self.phantom_until.is_some_and(|t| Instant::now() < t)
             || self
@@ -345,6 +463,13 @@ impl FakeRc {
             format!("{SYSTEM_KEY_PREFIX}i2c"),
             "1 device on the I2C bus".into(),
         ));
+        for (i, pad) in self.pads.iter().enumerate() {
+            let n = i + 1;
+            t.numbers
+                .insert(format!("gamepad{n}_left_stick_y"), pad.left_stick_y);
+            t.numbers
+                .insert(format!("gamepad{n}_a"), if pad.a { 1.0 } else { 0.0 });
+        }
         match self.state {
             RobotState::Init => {
                 t.push_line(format!("00 OpMode : {}", self.opmode));
@@ -363,7 +488,8 @@ impl FakeRc {
                     .insert("heading_deg".into(), (elapsed * 25.0) % 360.0 - 180.0);
                 t.numbers
                     .insert("drive_power".into(), 0.5 + 0.5 * (elapsed * 0.7).sin());
-                t.numbers.insert("left_stick_y".into(), self.left_stick_y);
+                t.numbers
+                    .insert("left_stick_y".into(), self.pads[0].left_stick_y);
                 t.push_line(format!(
                     "Servo Bus Current : {:.2} A",
                     1.6 + 0.8 * (elapsed * 1.3).sin()
@@ -602,50 +728,21 @@ fn main() {
 
     spawn_mjpeg_server(LIMELIGHT_PORT, "limelight");
 
-    let mut rc = FakeRc {
-        socket,
-        ds: None,
-        ds_seen: Instant::now(),
-        phantom_until: std::env::var("FAKE_RC_BUSY").ok().map(|s| {
-            Instant::now() + Duration::from_secs(s.parse().expect("invalid FAKE_RC_BUSY"))
-        }),
-        state: RobotState::NotStarted,
-        opmode: String::new(),
-        alliance: "RED",
-        start_position: "LEFT",
-        prev_x: false,
-        prev_y: false,
-        left_stick_y: 0.0,
-        seq: 0,
-        started: Instant::now(),
-        run_started: None,
-        configs: vec![
-            ConfigMeta {
-                is_dirty: false,
-                location: "LOCAL_STORAGE".to_string(),
-                name: "practice_bot".to_string(),
-                resource_id: 1,
-            },
-            // An immutable built-in, to exercise the copy-only (Save As) path.
-            ConfigMeta {
-                is_dirty: false,
-                location: "RESOURCE".to_string(),
-                name: "goBILDA Starter Bot".to_string(),
-                resource_id: 2132017159,
-            },
-        ],
-        active_config: ConfigMeta {
-            is_dirty: false,
-            location: "NONE".to_string(),
-            name: "<No Config Set>".to_string(),
-            resource_id: 0,
-        },
-        saved_xml: HashMap::new(),
-        next_resource_id: 1,
-        pending_activation: None,
-        webcam_available: false,
-        webcam_frame_num: 0,
-    };
+    let mut rc = FakeRc::new(socket);
+    rc.phantom_until = std::env::var("FAKE_RC_BUSY")
+        .ok()
+        .map(|s| Instant::now() + Duration::from_secs(s.parse().expect("invalid FAKE_RC_BUSY")));
+    rc.gamepad_loss = std::env::var("FAKE_RC_GAMEPAD_LOSS")
+        .ok()
+        .map(|s| {
+            let loss: f32 = s.parse().expect("invalid FAKE_RC_GAMEPAD_LOSS");
+            assert!(
+                (0.0..=1.0).contains(&loss),
+                "FAKE_RC_GAMEPAD_LOSS must be between 0 and 1"
+            );
+            loss
+        })
+        .unwrap_or(0.0);
 
     let mut buf = [0u8; 4096];
     let mut last_telemetry = Instant::now();
@@ -683,29 +780,7 @@ fn main() {
                     Ok(Packet::Heartbeat(_) | Packet::Command(_)) => {
                         println!("!! ignoring {from}: not the connected DS ({:?})", rc.ds);
                     }
-                    Ok(Packet::Gamepad(gp)) if gp.user == 1 => {
-                        if gp.left_stick_y != rc.left_stick_y {
-                            println!("gamepad{} left_stick_y={}", gp.user, gp.left_stick_y);
-                        }
-                        rc.left_stick_y = gp.left_stick_y;
-                        if rc.state == RobotState::Init {
-                            if gp.x && !rc.prev_x {
-                                rc.alliance = if rc.alliance == "RED" { "BLUE" } else { "RED" };
-                                println!("gamepad{} X: alliance -> {}", gp.user, rc.alliance);
-                            }
-                            if gp.y && !rc.prev_y {
-                                rc.start_position = if rc.start_position == "LEFT" {
-                                    "RIGHT"
-                                } else {
-                                    "LEFT"
-                                };
-                                println!("gamepad{} Y: start -> {}", gp.user, rc.start_position);
-                            }
-                        }
-                        rc.prev_x = gp.x;
-                        rc.prev_y = gp.y;
-                    }
-                    Ok(Packet::Gamepad(_)) => {}
+                    Ok(Packet::Gamepad(gp)) => rc.handle_gamepad(&gp),
                     Ok(_) => {}
                     Err(e) => println!("!! parse error: {e}"),
                 }
@@ -727,5 +802,71 @@ fn main() {
             last_rc_battery = Instant::now();
             rc.rc_battery_tick();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_rc() -> FakeRc {
+        FakeRc::new(UdpSocket::bind(("127.0.0.1", 0)).expect("bind a test socket"))
+    }
+
+    fn stick(user: u8, y: f32) -> Gamepad {
+        Gamepad {
+            user,
+            left_stick_y: y,
+            ..Gamepad::default()
+        }
+    }
+
+    #[test]
+    fn gamepad2_is_tracked_apart_from_gamepad1() {
+        let mut rc = test_rc();
+        rc.handle_gamepad(&stick(2, -0.5));
+        assert_eq!(rc.pads[1].left_stick_y, -0.5);
+        assert_eq!(rc.pads[0].left_stick_y, 0.0);
+    }
+
+    #[test]
+    fn other_users_are_ignored() {
+        let mut rc = test_rc();
+        rc.handle_gamepad(&stick(3, 1.0));
+        assert_eq!(rc.pads, [PadState::default(); 2]);
+    }
+
+    #[test]
+    fn init_toggles_stay_on_gamepad1() {
+        let mut rc = test_rc();
+        rc.state = RobotState::Init;
+        let x = |user| Gamepad {
+            user,
+            x: true,
+            ..Gamepad::default()
+        };
+        rc.handle_gamepad(&x(2));
+        assert_eq!(rc.alliance, "RED");
+        rc.handle_gamepad(&x(1));
+        assert_eq!(rc.alliance, "BLUE");
+    }
+
+    #[test]
+    fn full_loss_drops_every_gamepad_packet() {
+        let mut rc = test_rc();
+        rc.gamepad_loss = 1.0;
+        rc.handle_gamepad(&stick(1, -1.0));
+        assert_eq!(rc.pads[0].left_stick_y, 0.0);
+        rc.gamepad_loss = 0.0;
+        rc.handle_gamepad(&stick(1, -1.0));
+        assert_eq!(rc.pads[0].left_stick_y, -1.0);
+    }
+
+    #[test]
+    fn partial_loss_drops_about_that_fraction() {
+        let mut rc = test_rc();
+        rc.gamepad_loss = 0.5;
+        let dropped = (0..1000).filter(|_| rc.drop_gamepad()).count();
+        assert!((350..=650).contains(&dropped), "dropped {dropped} of 1000");
     }
 }

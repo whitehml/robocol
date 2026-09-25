@@ -1,0 +1,15 @@
+[package]
+name = "ds_daemon"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Daemon holding the one robocol connection that ds_cli and ds_agent share"
+
+[[bin]]
+name = "ds_daemon"
+path = "src/main.rs"
+
+[dependencies]
+robocol = { path = "../robocol" }
+ds_proto = { path = "../ds_proto" }
+serde_json = "1"

@@ -30,11 +30,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "ds_agent"
+version = "0.1.0"
+dependencies = [
+ "ds_proto",
+ "serde_json",
+]
+
+[[package]]
 name = "ds_cli"
 version = "0.1.0"
 dependencies = [
- "robocol",
+ "ds_proto",
  "rustyline",
+ "serde_json",
+]
+
+[[package]]
+name = "ds_daemon"
+version = "0.1.0"
+dependencies = [
+ "ds_proto",
+ "robocol",
+ "serde_json",
+]
+
+[[package]]
+name = "ds_proto"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
