@@ -162,6 +162,14 @@ fn drives_an_opmode_and_watches_telemetry_against_fake_rc() {
     let stop = run_agent(&tmp, &["stop"]);
     assert_eq!(stop["ok"], true);
 
+    let pretty = Command::new(bin_path("ds_agent"))
+        .args(["--pretty", "status"])
+        .env("XDG_RUNTIME_DIR", &tmp)
+        .output()
+        .expect("run ds_agent --pretty");
+    let text = String::from_utf8_lossy(&pretty.stdout);
+    assert!(text.contains("connected: true"), "--pretty status: {text}");
+
     // Watch: fake_rc streams telemetry at 10 Hz, so a short-lived watch
     // process should see at least one line before it's killed. Scoped in a
     // block so the ChildGuard drops (killing the watch) before `daemon
@@ -275,4 +283,38 @@ fn auto_spawns_daemon_logs_it_and_stops_it() {
 
     drop(guard); // best-effort second stop is a no-op; removes the dir
     assert!(!tmp.exists(), "runtime dir not removed");
+}
+
+#[test]
+fn a_daemon_that_dies_on_startup_is_explained() {
+    build_bins(&["ds_agent"]);
+
+    let tmp = tempdir("dead_");
+    // Hold a UDP port so the daemon ds_agent starts cannot bind it: the most
+    // common real failure (Deck Station already running on 20884).
+    let held = std::net::UdpSocket::bind(("0.0.0.0", 0)).expect("hold a UDP port");
+    let port = held.local_addr().unwrap().port();
+    let args = format!("--peer 127.0.0.1 --peer-port 1 --bind-port {port}");
+
+    let output = Command::new(bin_path("ds_agent"))
+        .arg("status")
+        .env("XDG_RUNTIME_DIR", &tmp)
+        .env("DS_DAEMON_ARGS", &args)
+        .output()
+        .expect("run ds_agent");
+    assert_eq!(output.status.code(), Some(1));
+    let reply: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("ds_agent printed JSON");
+    assert_eq!(reply["error"], "daemon_unreachable");
+    let message = reply["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!("cannot bind UDP port {port}")),
+        "the reason should reach ds_agent's own output: {message}"
+    );
+    assert!(
+        !tmp.join("ds_daemon.sock").exists(),
+        "a daemon that failed to start left its socket behind"
+    );
+
+    std::fs::remove_dir_all(&tmp).expect("clean up runtime dir");
 }
