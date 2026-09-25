@@ -115,8 +115,9 @@ Nobody takes over a pushed stick, and claiming again clears a stuck one.
 `watch` prints one line per event: `connected`, `disconnected`,
 `peer_busy`, `state`, `telemetry`, `opmode_inited`, `opmode_running`,
 `command`, `stacktrace`, `command_dropped`, `protocol_error`,
-`webcam_available`, `gamepad_owner`. `status` has the latest of everything,
-including the current `opmode` and who holds each gamepad.
+`webcam_available`, `gamepad_owner`. `status` has the current state:
+connection, robot state, the current `opmode`, opmodes, configs, the latest
+telemetry per tag, and who holds each gamepad.
 
 ### Errors
 
@@ -126,7 +127,7 @@ including the current `opmode` and who holds each gamepad.
 | `peer_busy` | another driver station owns the RC | close it, then run `connect` |
 | `preempted` | the operator holds that gamepad | wait until it releases it or quits `ds_cli` |
 | `not_claimed` | you have not claimed that gamepad | run `claim gamepad1` |
-| `daemon_unreachable` | the daemon is not running and could not start | read the message; it quotes the daemon's log |
+| `daemon_unreachable` | the daemon could not be started, reached, or did not answer | read the message; if a daemon it started failed, it quotes the daemon's log |
 | `timeout` | the RC did not answer in time | check `status`, try again |
 | `bad_args` | the command or its arguments are wrong | check the usage `ds_agent` prints, or `help` in `ds_cli` |
 

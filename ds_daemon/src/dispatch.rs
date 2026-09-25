@@ -107,25 +107,29 @@ impl Daemon {
         }
     }
 
-    /// Stops the daemon for `shutdown`: returns every held pad to neutral,
-    /// removes the socket, and exits. The arbiter lock is kept from here on,
-    /// so no pulse can send another packet.
+    /// Stops the daemon for `shutdown`: removes the socket first, so the
+    /// next front end starts a fresh daemon instead of reaching this one on
+    /// its way out, returns every held pad to neutral, and exits. The
+    /// arbiter lock is kept from here on, so no pulse can send another
+    /// packet; with no pad held, it exits at once.
     pub fn shut_down(&self) -> ! {
+        let _ = std::fs::remove_file(ds_proto::socket_path());
         let arbiter = self.gamepads();
         let held: Vec<Pad> = Pad::ALL
             .into_iter()
             .filter(|pad| arbiter.owner(*pad).is_some())
             .collect();
-        for _ in 0..gamepad::TAIL_PACKETS {
-            for &pad in &held {
-                self.send_gamepad(&gamepad::neutral(pad));
+        if !held.is_empty() {
+            for _ in 0..gamepad::TAIL_PACKETS {
+                for &pad in &held {
+                    self.send_gamepad(&gamepad::neutral(pad));
+                }
+                std::thread::sleep(Duration::from_millis(gamepad::PULSE_PERIOD_MS));
             }
-            std::thread::sleep(Duration::from_millis(gamepad::PULSE_PERIOD_MS));
+            // robocol sends from its own thread: give it a moment to put the
+            // last packets on the wire.
+            std::thread::sleep(Duration::from_millis(50));
         }
-        let _ = std::fs::remove_file(ds_proto::socket_path());
-        // robocol sends from its own thread: give it a moment to put the
-        // last packets on the wire.
-        std::thread::sleep(Duration::from_millis(50));
         std::process::exit(0);
     }
 

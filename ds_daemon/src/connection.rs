@@ -4,7 +4,9 @@
 //!
 //! A reader thread takes the client's lines off the socket, so a hang-up is
 //! noticed even while a request is running: it marks the session, and a
-//! running gamepad pulse stops instead of driving on for nobody.
+//! running gamepad pulse stops instead of driving on for nobody. A client
+//! that closes its sending side counts as gone, so a client must keep the
+//! connection open until it has its replies (the front ends do).
 
 use std::io::BufReader;
 use std::os::unix::net::UnixStream;

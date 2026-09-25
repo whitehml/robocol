@@ -611,11 +611,14 @@ fn parse_gamepad(args: &[&str]) -> Result<Request, String> {
         } else if flag == "duration" {
             input.duration_ms = Some(parse_duration_ms(value)?);
         } else if let Some(slot) = input.axis(&flag) {
-            *slot = Some(
-                value
-                    .parse()
-                    .map_err(|_| format!("--{flag} expects a number, got {value:?}"))?,
-            );
+            // NaN and infinities (or `1e39`, which overflows to one) would go
+            // on the wire as `null`, read by the daemon as "not set".
+            let number = value
+                .parse::<f32>()
+                .ok()
+                .filter(|n| n.is_finite())
+                .ok_or_else(|| format!("--{flag} expects a number, got {value:?}"))?;
+            *slot = Some(number);
         } else if let Some(slot) = input.button(&flag) {
             *slot = Some(
                 value
@@ -799,6 +802,12 @@ mod tests {
     fn gamepad_rejects_bad_flags_and_values() {
         assert!(parse(&["gamepad", "--not-a-flag", "1"]).is_err());
         assert!(parse(&["gamepad", "--left-stick-y", "fast"]).is_err());
+        for not_finite in ["NaN", "inf", "-inf", "1e39"] {
+            assert!(
+                parse(&["gamepad", "--left-stick-y", not_finite]).is_err(),
+                "{not_finite} was accepted"
+            );
+        }
         assert!(parse(&["gamepad", "--a", "yes"]).is_err());
         assert!(parse(&["gamepad", "--a"]).is_err());
         assert!(parse(&["gamepad", "a", "true"]).is_err());

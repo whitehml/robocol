@@ -901,3 +901,35 @@ fn a_second_daemon_leaves_the_first_alone() {
         "shutdown left the socket behind"
     );
 }
+
+#[test]
+fn a_command_right_after_shutdown_starts_a_fresh_daemon() {
+    build_bins(&["ds_agent"]);
+
+    let tmp = tempdir("again_");
+    // Port 1: nothing answers, so no fake_rc is needed.
+    let env: Vec<(&str, &str)> = vec![(
+        "DS_DAEMON_ARGS",
+        "--peer 127.0.0.1 --peer-port 1 --bind-port 0",
+    )];
+    let _daemon = SpawnedDaemonGuard {
+        dir: tmp.to_path_buf(),
+        env: env.clone(),
+    };
+
+    // Holding a pad makes shutdown linger while it sends the neutral burst.
+    let claim = run_agent_with_env(&tmp, &["claim", "gamepad1"], &env);
+    assert_eq!(claim["ok"], true, "{claim}");
+    let stopped = run_agent_with_env(&tmp, &["shutdown"], &env);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+
+    // Chained with no pause, as a script would: this must reach a new
+    // daemon, not the old one on its way out.
+    let status = run_agent_with_env(&tmp, &["status"], &env);
+    assert_eq!(status["ok"], true, "{status}");
+    assert_eq!(
+        status["gamepads"]["gamepad1"],
+        serde_json::Value::Null,
+        "a new daemon starts with no claims"
+    );
+}

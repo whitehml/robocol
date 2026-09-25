@@ -15,8 +15,10 @@ use serde_json::Value;
 
 use crate::request::{Request, Role};
 
-/// How long a front end waits for a daemon it just started.
-const SPAWN_WAIT: Duration = Duration::from_secs(3);
+/// How long a front end waits for a daemon it just started. Normally a
+/// fraction of a second, but on macOS the first launch of a freshly built
+/// binary can take seconds while the system assesses it.
+const SPAWN_WAIT: Duration = Duration::from_secs(10);
 /// How much of the daemon's log to quote when it dies while starting.
 const LOG_TAIL_LINES: usize = 5;
 /// Longest a request waits for its reply before giving up on the daemon:
@@ -202,6 +204,15 @@ pub fn connect_or_spawn(role: Role, extra_args: &[String]) -> Result<Connection,
             ));
         }
         std::thread::sleep(Duration::from_millis(100));
+        // A daemon that exited cleanly lost the instance lock to another:
+        // one still starting (its socket will appear) or one shutting down
+        // (its socket is already gone for good). Start another in case it
+        // was the latter; while the lock is still held it just exits again.
+        if matches!(child.try_wait(), Ok(Some(status)) if status.success())
+            && UnixStream::connect(socket_path()).is_err()
+        {
+            child = spawn_daemon(extra_args)?;
+        }
     }
 }
 
