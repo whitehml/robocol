@@ -3,8 +3,10 @@
 //! this logic lives once instead of being duplicated on each side of the pipe.
 
 pub mod filter;
+pub mod request;
 
 pub use filter::WatchFilter;
+pub use request::{GamepadInput, PARSE_TABLE, Request, Verb, parse, split_line};
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;

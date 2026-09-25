@@ -1,99 +1,19 @@
-//! The daemon's JSON protocol: parsing one request off the wire and turning
-//! it into a `robocol` client call plus a reply, using `DaemonState` for
-//! instant answers (`status`) and name lookups, and `WaiterRegistry` to
-//! correlate a request with the `Event` that answers it.
+//! Turns one `ds_proto::Request` into `robocol` client calls and a JSON
+//! reply, using `DaemonState` for instant answers (`status`) and name
+//! lookups, and `WaiterRegistry` to correlate a request with the `Event` that
+//! answers it.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use ds_proto::Request;
 use robocol::client::{Event, RobocolClient};
 use robocol::cmd::parse_config_list;
 use robocol::packets::Gamepad;
-use serde::Deserialize;
 
+use crate::gamepad::to_packet;
 use crate::state::DaemonState;
 use crate::waiters::{WaiterKind, WaiterPredicate, WaiterRegistry};
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "cmd", rename_all = "kebab-case")]
-pub enum Request {
-    Ping,
-    Status,
-    List,
-    Init {
-        name: String,
-    },
-    Run {
-        name: Option<String>,
-    },
-    Stop,
-    Restart,
-    ActiveConfig,
-    Configs,
-    Config {
-        name: String,
-    },
-    SaveConfig {
-        json: String,
-    },
-    ActivateConfig {
-        name: String,
-    },
-    DeleteConfig {
-        name: String,
-    },
-    DeviceTypes,
-    Scan,
-    LynxModules {
-        serial: String,
-    },
-    Gamepad {
-        #[serde(default)]
-        left_stick_x: Option<f32>,
-        #[serde(default)]
-        left_stick_y: Option<f32>,
-        #[serde(default)]
-        right_stick_x: Option<f32>,
-        #[serde(default)]
-        right_stick_y: Option<f32>,
-        #[serde(default)]
-        left_trigger: Option<f32>,
-        #[serde(default)]
-        right_trigger: Option<f32>,
-        #[serde(default)]
-        dpad_up: Option<bool>,
-        #[serde(default)]
-        dpad_down: Option<bool>,
-        #[serde(default)]
-        dpad_left: Option<bool>,
-        #[serde(default)]
-        dpad_right: Option<bool>,
-        #[serde(default)]
-        a: Option<bool>,
-        #[serde(default)]
-        b: Option<bool>,
-        #[serde(default)]
-        x: Option<bool>,
-        #[serde(default)]
-        y: Option<bool>,
-        #[serde(default)]
-        start: Option<bool>,
-        #[serde(default)]
-        back: Option<bool>,
-        #[serde(default)]
-        left_bumper: Option<bool>,
-        #[serde(default)]
-        right_bumper: Option<bool>,
-        #[serde(default)]
-        left_stick_button: Option<bool>,
-        #[serde(default)]
-        right_stick_button: Option<bool>,
-        #[serde(default)]
-        duration_ms: Option<u64>,
-    },
-    Watch,
-    Shutdown,
-}
 
 fn err(code: &str, message: impl Into<String>) -> serde_json::Value {
     serde_json::json!({"ok": false, "error": code, "message": message.into()})
@@ -152,54 +72,6 @@ fn wait_for_event(
             .unregister(id);
         err("timeout", "robot controller did not respond in time")
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_gamepad(
-    left_stick_x: Option<f32>,
-    left_stick_y: Option<f32>,
-    right_stick_x: Option<f32>,
-    right_stick_y: Option<f32>,
-    left_trigger: Option<f32>,
-    right_trigger: Option<f32>,
-    dpad_up: Option<bool>,
-    dpad_down: Option<bool>,
-    dpad_left: Option<bool>,
-    dpad_right: Option<bool>,
-    a: Option<bool>,
-    b: Option<bool>,
-    x: Option<bool>,
-    y: Option<bool>,
-    start: Option<bool>,
-    back: Option<bool>,
-    left_bumper: Option<bool>,
-    right_bumper: Option<bool>,
-    left_stick_button: Option<bool>,
-    right_stick_button: Option<bool>,
-) -> Gamepad {
-    Gamepad {
-        left_stick_x: left_stick_x.unwrap_or(0.0),
-        left_stick_y: left_stick_y.unwrap_or(0.0),
-        right_stick_x: right_stick_x.unwrap_or(0.0),
-        right_stick_y: right_stick_y.unwrap_or(0.0),
-        left_trigger: left_trigger.unwrap_or(0.0),
-        right_trigger: right_trigger.unwrap_or(0.0),
-        dpad_up: dpad_up.unwrap_or(false),
-        dpad_down: dpad_down.unwrap_or(false),
-        dpad_left: dpad_left.unwrap_or(false),
-        dpad_right: dpad_right.unwrap_or(false),
-        a: a.unwrap_or(false),
-        b: b.unwrap_or(false),
-        x: x.unwrap_or(false),
-        y: y.unwrap_or(false),
-        start: start.unwrap_or(false),
-        back: back.unwrap_or(false),
-        left_bumper: left_bumper.unwrap_or(false),
-        right_bumper: right_bumper.unwrap_or(false),
-        left_stick_button: left_stick_button.unwrap_or(false),
-        right_stick_button: right_stick_button.unwrap_or(false),
-        ..Gamepad::default()
-    }
 }
 
 pub fn handle_request(
@@ -508,56 +380,13 @@ pub fn handle_request(
                 Err(e) => e,
             }
         }
-        Request::Gamepad {
-            left_stick_x,
-            left_stick_y,
-            right_stick_x,
-            right_stick_y,
-            left_trigger,
-            right_trigger,
-            dpad_up,
-            dpad_down,
-            dpad_left,
-            dpad_right,
-            a,
-            b,
-            x,
-            y,
-            start,
-            back,
-            left_bumper,
-            right_bumper,
-            left_stick_button,
-            right_stick_button,
-            duration_ms,
-        } => {
-            let gamepad = build_gamepad(
-                left_stick_x,
-                left_stick_y,
-                right_stick_x,
-                right_stick_y,
-                left_trigger,
-                right_trigger,
-                dpad_up,
-                dpad_down,
-                dpad_left,
-                dpad_right,
-                a,
-                b,
-                x,
-                y,
-                start,
-                back,
-                left_bumper,
-                right_bumper,
-                left_stick_button,
-                right_stick_button,
-            );
+        Request::Gamepad(input) => {
+            let gamepad = to_packet(&input);
             client
                 .lock()
                 .expect("client mutex poisoned")
                 .send_gamepad(gamepad);
-            if let Some(ms) = duration_ms {
+            if let Some(ms) = input.duration_ms {
                 std::thread::sleep(Duration::from_millis(ms));
                 client
                     .lock()
@@ -707,29 +536,7 @@ mod tests {
         let (state, waiters) = deps();
         let client = unreachable_client();
         let reply = handle_request(
-            Request::Gamepad {
-                left_stick_x: None,
-                left_stick_y: None,
-                right_stick_x: None,
-                right_stick_y: None,
-                left_trigger: None,
-                right_trigger: None,
-                dpad_up: None,
-                dpad_down: None,
-                dpad_left: None,
-                dpad_right: None,
-                a: None,
-                b: None,
-                x: None,
-                y: None,
-                start: None,
-                back: None,
-                left_bumper: None,
-                right_bumper: None,
-                left_stick_button: None,
-                right_stick_button: None,
-                duration_ms: None,
-            },
+            Request::Gamepad(ds_proto::GamepadInput::default()),
             &client,
             &state,
             &waiters,

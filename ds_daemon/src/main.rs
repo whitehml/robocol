@@ -3,7 +3,8 @@
 //! domain socket, one JSON object per line. See the repo README for usage.
 
 mod connection;
-mod request;
+mod dispatch;
+mod gamepad;
 mod state;
 mod waiters;
 mod watch;

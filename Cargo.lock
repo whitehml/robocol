@@ -51,7 +51,6 @@ version = "0.1.0"
 dependencies = [
  "ds_proto",
  "robocol",
- "serde",
  "serde_json",
 ]
 
@@ -60,6 +59,7 @@ name = "ds_proto"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "serde",
  "serde_json",
 ]
 

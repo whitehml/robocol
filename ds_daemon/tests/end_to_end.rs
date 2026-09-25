@@ -190,17 +190,17 @@ fn drives_an_opmode_and_watches_telemetry_against_fake_rc() {
         assert_eq!(event["event"], "telemetry");
     }
 
-    // Explicit teardown via `daemon stop`, ahead of ChildGuard's Drop kill,
+    // Explicit teardown via `shutdown`, ahead of ChildGuard's Drop kill,
     // proves the shutdown command itself works — and that the daemon
     // actually exits on it, not just acknowledges.
-    let stopped = run_agent(&tmp, &["daemon", "stop"]);
+    let stopped = run_agent(&tmp, &["shutdown"]);
     assert_eq!(stopped["ok"], true);
     assert!(
         wait_until(Duration::from_secs(2), || matches!(
             daemon.0.try_wait(),
             Ok(Some(_))
         )),
-        "daemon did not exit after `daemon stop`"
+        "daemon did not exit after `shutdown`"
     );
     let _ = fake_rc.0.kill();
 
@@ -218,7 +218,7 @@ struct SpawnedDaemonGuard {
 impl Drop for SpawnedDaemonGuard {
     fn drop(&mut self) {
         let _ = Command::new(bin_path("ds_agent"))
-            .args(["daemon", "stop"])
+            .arg("shutdown")
             .env("XDG_RUNTIME_DIR", &self.dir)
             .envs(self.env.iter().copied())
             .stdout(Stdio::null())
@@ -256,17 +256,17 @@ fn auto_spawns_daemon_logs_it_and_stops_it() {
         log.display()
     );
 
-    let daemon_status = run_agent_with_env(&tmp, &["daemon", "status"], &env);
-    assert_eq!(daemon_status["running"], true);
+    let ping = run_agent_with_env(&tmp, &["ping"], &env);
+    assert_eq!(ping["running"], true);
 
-    let stopped = run_agent_with_env(&tmp, &["daemon", "stop"], &env);
-    assert_eq!(stopped["ok"], true, "daemon stop reply: {stopped}");
+    let stopped = run_agent_with_env(&tmp, &["shutdown"], &env);
+    assert_eq!(stopped["ok"], true, "shutdown reply: {stopped}");
 
     let socket = tmp.join("ds_daemon.sock");
     assert!(
         wait_until(Duration::from_secs(2), || UnixStream::connect(&socket)
             .is_err()),
-        "ds_daemon still accepting connections after `daemon stop`"
+        "ds_daemon still accepting connections after `shutdown`"
     );
 
     drop(guard); // best-effort second stop is a no-op; removes the dir

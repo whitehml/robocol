@@ -1,6 +1,6 @@
 //! Per-connection handling: reads one request line, and either streams
 //! `watch` events, exits the process for `shutdown`, or dispatches
-//! everything else through `request::handle_request` for a single reply.
+//! everything else through `dispatch::handle_request` for a single reply.
 
 use std::io::BufReader;
 use std::os::unix::net::UnixStream;
@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use robocol::client::RobocolClient;
 
-use crate::request::{Request, handle_request};
+use ds_proto::Request;
+
+use crate::dispatch::handle_request;
 use crate::state::DaemonState;
 use crate::waiters::{Subscribers, WaiterRegistry};
 

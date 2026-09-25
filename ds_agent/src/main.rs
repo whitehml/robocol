@@ -1,13 +1,15 @@
 //! Non-interactive front end for `ds_daemon`. One invocation, one JSON request,
-//! one reply on stdout — see `ds_cli` for the interactive REPL this mirrors.
+//! one reply on stdout. Verbs and their arguments come from `ds_proto`'s
+//! shared table, so anything `ds_cli` accepts, this accepts too.
 //!
 //! ```sh
 //! ds_agent list
 //! ds_agent init "Duo (TeleOp)"
-//! ds_agent run
+//! ds_agent run "Duo (TeleOp)"
 //! ds_agent gamepad --left-stick-y -0.5 --duration 300ms
 //! ds_agent watch --types telemetry --tag TELEMETRY_DATA --key heading_deg
-//! ds_agent daemon status
+//! ds_agent ping       # is a daemon running? never starts one
+//! ds_agent shutdown   # stop the daemon; never starts one
 //! DS_DAEMON_ARGS="--peer 192.168.43.1 --bind-port 0" ds_agent status   # extra ds_daemon flags on auto-spawn
 //! ```
 
@@ -16,143 +18,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};
 
-fn build_request(args: &[String]) -> Result<serde_json::Value, String> {
-    let Some(cmd) = args.first() else {
-        return Err("usage: ds_agent <command> [args]".into());
-    };
-    match cmd.as_str() {
-        "list" => Ok(serde_json::json!({"cmd": "list"})),
-        "init" => {
-            let name = args.get(1).ok_or("usage: ds_agent init <name>")?;
-            Ok(serde_json::json!({"cmd": "init", "name": name}))
-        }
-        "run" => Ok(serde_json::json!({"cmd": "run", "name": args.get(1)})),
-        "stop" => Ok(serde_json::json!({"cmd": "stop"})),
-        "restart" => Ok(serde_json::json!({"cmd": "restart"})),
-        "active-config" => Ok(serde_json::json!({"cmd": "active-config"})),
-        "configs" => Ok(serde_json::json!({"cmd": "configs"})),
-        "config" => {
-            let name = args.get(1).ok_or("usage: ds_agent config <name>")?;
-            Ok(serde_json::json!({"cmd": "config", "name": name}))
-        }
-        "save-config" => {
-            let json = args.get(1).ok_or("usage: ds_agent save-config <json>")?;
-            Ok(serde_json::json!({"cmd": "save-config", "json": json}))
-        }
-        "activate-config" => {
-            let name = args
-                .get(1)
-                .ok_or("usage: ds_agent activate-config <name>")?;
-            Ok(serde_json::json!({"cmd": "activate-config", "name": name}))
-        }
-        "delete-config" => {
-            let name = args.get(1).ok_or("usage: ds_agent delete-config <name>")?;
-            Ok(serde_json::json!({"cmd": "delete-config", "name": name}))
-        }
-        "device-types" => Ok(serde_json::json!({"cmd": "device-types"})),
-        "scan" => Ok(serde_json::json!({"cmd": "scan"})),
-        "lynx-modules" => {
-            let serial = args.get(1).ok_or("usage: ds_agent lynx-modules <serial>")?;
-            Ok(serde_json::json!({"cmd": "lynx-modules", "serial": serial}))
-        }
-        "gamepad" => build_gamepad_request(&args[1..]),
-        "status" => Ok(serde_json::json!({"cmd": "status"})),
-        "watch" => build_watch_request(&args[1..]),
-        other => Err(format!("unknown command: {other}")),
-    }
-}
-
-const GAMEPAD_FLOAT_FLAGS: &[&str] = &[
-    "left_stick_x",
-    "left_stick_y",
-    "right_stick_x",
-    "right_stick_y",
-    "left_trigger",
-    "right_trigger",
-];
-const GAMEPAD_BOOL_FLAGS: &[&str] = &[
-    "dpad_up",
-    "dpad_down",
-    "dpad_left",
-    "dpad_right",
-    "a",
-    "b",
-    "x",
-    "y",
-    "start",
-    "back",
-    "left_bumper",
-    "right_bumper",
-    "left_stick_button",
-    "right_stick_button",
-];
-
-fn parse_duration_ms(value: &str) -> Result<u64, String> {
-    if let Some(ms) = value.strip_suffix("ms") {
-        ms.parse().map_err(|_| format!("invalid duration: {value}"))
-    } else if let Some(s) = value.strip_suffix('s') {
-        match s.parse::<f64>() {
-            Ok(secs) if secs.is_finite() && secs >= 0.0 => Ok((secs * 1000.0) as u64),
-            _ => Err(format!("invalid duration: {value}")),
-        }
-    } else {
-        value
-            .parse()
-            .map_err(|_| format!("invalid duration: {value}"))
-    }
-}
-
-fn build_gamepad_request(args: &[String]) -> Result<serde_json::Value, String> {
-    let mut map = serde_json::Map::new();
-    map.insert("cmd".into(), serde_json::json!("gamepad"));
-    let mut i = 0;
-    while i < args.len() {
-        let flag = args[i]
-            .strip_prefix("--")
-            .ok_or_else(|| format!("expected --flag, got {}", args[i]))?;
-        let key = flag.replace('-', "_");
-        if key == "duration" {
-            let value = args.get(i + 1).ok_or("missing value for --duration")?;
-            map.insert(
-                "duration_ms".into(),
-                serde_json::json!(parse_duration_ms(value)?),
-            );
-            i += 2;
-            continue;
-        }
-        let value = args
-            .get(i + 1)
-            .ok_or_else(|| format!("missing value for --{flag}"))?;
-        if GAMEPAD_FLOAT_FLAGS.contains(&key.as_str()) {
-            let parsed: f32 = value
-                .parse()
-                .map_err(|_| format!("--{flag} expects a number"))?;
-            map.insert(key, serde_json::json!(parsed));
-        } else if GAMEPAD_BOOL_FLAGS.contains(&key.as_str()) {
-            let parsed: bool = value
-                .parse()
-                .map_err(|_| format!("--{flag} expects true/false"))?;
-            map.insert(key, serde_json::json!(parsed));
-        } else if key == "duration_ms" {
-            let parsed: u64 = value
-                .parse()
-                .map_err(|_| format!("--{flag} expects milliseconds"))?;
-            map.insert(key, serde_json::json!(parsed));
-        } else {
-            return Err(format!("unknown gamepad flag: --{flag}"));
-        }
-        i += 2;
-    }
-    Ok(serde_json::Value::Object(map))
-}
-
-/// The daemon streams every event; the flags only narrow what this process
-/// prints, so they are validated here and never sent.
-fn build_watch_request(args: &[String]) -> Result<serde_json::Value, String> {
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    ds_proto::WatchFilter::parse(&refs)?;
-    Ok(serde_json::json!({"cmd": "watch"}))
-}
+use ds_proto::{Request, WatchFilter};
 
 /// Connects to the daemon, spawning it detached (its own process group) if
 /// needed. A spawned daemon's stdout and stderr are redirected to a `.log`
@@ -227,74 +93,62 @@ fn round_trip(mut stream: UnixStream, request: &serde_json::Value) -> Option<ser
     serde_json::from_str(&line).ok()
 }
 
-fn run_daemon_subcommand(args: &[String]) -> i32 {
-    let path = ds_proto::socket_path();
-    match args.first().map(String::as_str) {
-        Some("status") => match UnixStream::connect(&path) {
-            Ok(stream) => match round_trip(stream, &serde_json::json!({"cmd": "status"})) {
-                Some(mut status) => {
-                    // `running` is always present: false when there is no
-                    // socket to connect to, true when the daemon answered.
-                    if let Some(obj) = status.as_object_mut() {
-                        obj.insert("running".into(), serde_json::Value::Bool(true));
-                    }
-                    println!("{status}");
-                    0
-                }
-                None => print_unreachable("ds_daemon accepted the connection but did not answer"),
-            },
-            Err(_) => {
-                println!(r#"{{"ok":true,"running":false}}"#);
-                0
+/// `ping` and `shutdown` are about the daemon itself, so they never start
+/// one: with no daemon running they answer `{"ok":true,"running":false}`.
+fn run_without_spawning(request: &serde_json::Value) -> i32 {
+    let Ok(stream) = UnixStream::connect(ds_proto::socket_path()) else {
+        println!(r#"{{"ok":true,"running":false}}"#);
+        return 0;
+    };
+    match round_trip(stream, request) {
+        Some(mut reply) if reply["ok"] == true => {
+            if request["cmd"] == "ping"
+                && let Some(obj) = reply.as_object_mut()
+            {
+                obj.insert("running".into(), serde_json::Value::Bool(true));
             }
-        },
-        Some("stop") => match UnixStream::connect(&path) {
-            Ok(stream) => match round_trip(stream, &serde_json::json!({"cmd": "shutdown"})) {
-                Some(reply) if reply["ok"] == true => {
-                    println!("{reply}");
-                    0
-                }
-                _ => print_unreachable("ds_daemon did not acknowledge shutdown"),
-            },
-            Err(_) => {
-                println!(r#"{{"ok":true,"running":false}}"#);
-                0
-            }
-        },
-        _ => {
-            eprintln!("usage: ds_agent daemon <status|stop>");
-            2
+            println!("{reply}");
+            0
         }
+        Some(reply) => {
+            println!("{reply}");
+            1
+        }
+        None => print_unreachable("ds_daemon accepted the connection but did not answer"),
     }
 }
 
 fn main() {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
-    if raw_args.first().map(String::as_str) == Some("daemon") {
-        std::process::exit(run_daemon_subcommand(&raw_args[1..]));
+    let words: Vec<&str> = raw_args.iter().map(String::as_str).collect();
+    if words.is_empty() {
+        let verbs: Vec<&str> = ds_proto::PARSE_TABLE.iter().map(|v| v.name).collect();
+        eprintln!("usage: ds_agent <verb> [args]\nverbs: {}", verbs.join(", "));
+        std::process::exit(2);
     }
-
-    let request = match build_request(&raw_args) {
+    let request = match ds_proto::parse(&words) {
         Ok(r) => r,
         Err(msg) => {
             eprintln!("{msg}");
             std::process::exit(2);
         }
     };
-    let is_watch = request["cmd"] == "watch";
+    let wire = serde_json::to_value(&request).expect("a Request always serializes");
+    if matches!(request, Request::Ping | Request::Shutdown) {
+        std::process::exit(run_without_spawning(&wire));
+    }
 
     let mut stream = match connect_or_spawn() {
         Ok(s) => s,
         Err(msg) => print_unreachable(&msg),
     };
-    if ds_proto::write_message(&mut stream, &request).is_err() {
+    if ds_proto::write_message(&mut stream, &wire).is_err() {
         print_unreachable("failed to write to ds_daemon");
     }
 
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-    if is_watch {
-        let flags: Vec<&str> = raw_args[1..].iter().map(String::as_str).collect();
-        let filter = ds_proto::WatchFilter::parse(&flags).expect("validated by build_request");
+    if request == Request::Watch {
+        let filter = WatchFilter::parse(&words[1..]).expect("parse() validated the watch flags");
         while let Ok(Some(line)) = ds_proto::read_message(&mut reader) {
             let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
@@ -317,92 +171,5 @@ fn main() {
             eprintln!("no response from ds_daemon");
             std::process::exit(1);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn list_needs_no_arguments() {
-        let req = build_request(&["list".to_string()]).unwrap();
-        assert_eq!(req, serde_json::json!({"cmd": "list"}));
-    }
-
-    #[test]
-    fn init_requires_a_name() {
-        assert!(build_request(&["init".to_string()]).is_err());
-        let req = build_request(&["init".to_string(), "Duo (TeleOp)".to_string()]).unwrap();
-        assert_eq!(
-            req,
-            serde_json::json!({"cmd": "init", "name": "Duo (TeleOp)"})
-        );
-    }
-
-    #[test]
-    fn run_without_a_name_sends_null() {
-        let req = build_request(&["run".to_string()]).unwrap();
-        assert_eq!(req, serde_json::json!({"cmd": "run", "name": null}));
-    }
-
-    #[test]
-    fn unknown_command_is_an_error() {
-        assert!(build_request(&["not-a-command".to_string()]).is_err());
-    }
-
-    #[test]
-    fn gamepad_parses_floats_bools_and_duration() {
-        let args: Vec<String> = [
-            "gamepad",
-            "--left-stick-y",
-            "-0.5",
-            "--a",
-            "true",
-            "--duration",
-            "300ms",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        let req = build_request(&args).unwrap();
-        assert_eq!(req["cmd"], "gamepad");
-        assert_eq!(req["left_stick_y"], -0.5);
-        assert_eq!(req["a"], true);
-        assert_eq!(req["duration_ms"], 300);
-    }
-
-    #[test]
-    fn duration_seconds_rejects_negative_and_non_finite() {
-        assert_eq!(parse_duration_ms("1.5s"), Ok(1500));
-        assert_eq!(parse_duration_ms("0s"), Ok(0));
-        assert!(parse_duration_ms("-1s").is_err());
-        assert!(parse_duration_ms("nans").is_err());
-        assert!(parse_duration_ms("infs").is_err());
-    }
-
-    #[test]
-    fn gamepad_rejects_unknown_flags() {
-        let args: Vec<String> = ["gamepad", "--not-a-flag", "1"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert!(build_request(&args).is_err());
-    }
-
-    #[test]
-    fn watch_validates_its_flags_but_sends_none() {
-        let args: Vec<String> = ["watch", "--types", "telemetry", "--key", "heading_deg"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let req = build_request(&args).unwrap();
-        assert_eq!(req, serde_json::json!({"cmd": "watch"}));
-
-        let bad: Vec<String> = ["watch", "--types", "nope"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert!(build_request(&bad).is_err());
     }
 }
