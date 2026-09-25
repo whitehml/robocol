@@ -3,7 +3,8 @@
 //! belongs to one connection. Nothing here knows about sockets, so any
 //! transport can drive `handle_request`.
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use ds_proto::{Pad, Request, Role};
@@ -12,7 +13,8 @@ use robocol::cmd::{ConfigMeta, parse_config_list};
 use serde_json::{Value, json};
 
 use crate::gamepad::{
-    self, Arbiter, DEFAULT_PULSE_MS, MAX_PULSE_MS, OwnerChange, PulseEnd, Refusal, to_packet,
+    self, Arbiter, DEFAULT_PULSE_MS, MAX_PULSE_MS, OwnerChange, PulseEnd, Refusal, check_input,
+    to_packet,
 };
 use crate::state::DaemonState;
 use crate::waiters::{Subscribers, WaiterKind, WaiterPredicate, WaiterRegistry};
@@ -24,6 +26,11 @@ pub struct Daemon {
     pub waiters: Mutex<WaiterRegistry>,
     pub subscribers: Mutex<Subscribers>,
     pub gamepads: Mutex<Arbiter>,
+    /// How many connections currently speak as the operator. Pads belong to
+    /// a role, not a connection, so when the last operator leaves its pads
+    /// are released; otherwise they would lock the agent out with nobody
+    /// left to release them.
+    operators: Mutex<usize>,
     /// How long a request waits for the RC's answer.
     pub timeout: Duration,
 }
@@ -36,6 +43,7 @@ impl Daemon {
             waiters: Mutex::new(WaiterRegistry::new()),
             subscribers: Mutex::new(Subscribers::new()),
             gamepads: Mutex::new(Arbiter::default()),
+            operators: Mutex::new(0),
             timeout,
         }
     }
@@ -62,10 +70,42 @@ impl Daemon {
         self.client().send_gamepad(packet.clone());
     }
 
-    fn announce(&self, changes: &[OwnerChange]) {
-        let mut subscribers = self.subscribers.lock().expect("subscribers mutex poisoned");
-        for change in changes {
-            subscribers.broadcast(&change.to_json());
+    /// Tells every watcher a pad changed hands. Called with the arbiter lock
+    /// held, which is always taken before the subscribers lock.
+    fn announce(&self, change: &OwnerChange) {
+        self.subscribers
+            .lock()
+            .expect("subscribers mutex poisoned")
+            .broadcast(&change.to_json());
+    }
+
+    fn operator_joined(&self) {
+        *self.operators.lock().expect("operators mutex poisoned") += 1;
+    }
+
+    /// One operator connection is gone; if it was the last, give back the
+    /// operator's pads (neutral burst and `gamepad_owner` included). The
+    /// count stays locked until then, so an operator arriving meanwhile
+    /// cannot have its fresh claim released.
+    fn operator_left(&self) {
+        let mut operators = self.operators.lock().expect("operators mutex poisoned");
+        *operators = operators.saturating_sub(1);
+        if *operators == 0 {
+            gamepad::release(
+                &self.gamepads,
+                Role::Operator,
+                &Pad::ALL,
+                |change| self.announce(change),
+                |packet| self.send_gamepad(packet),
+            );
+        }
+    }
+
+    /// Called by the connection layer once a session is over: its client
+    /// hung up, or the connection became a `watch` stream.
+    pub fn end_session(&self, session: &Session) {
+        if session.role == Role::Operator {
+            self.operator_left();
         }
     }
 }
@@ -76,6 +116,9 @@ pub struct Session {
     pub role: Role,
     /// The opmode this connection last inited, for a bare `run`.
     pub last_inited: Option<String>,
+    /// Set by the connection layer when the client goes away, so a pulse it
+    /// asked for stops early instead of driving on for nobody.
+    pub hung_up: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -83,7 +126,12 @@ impl Session {
         Session {
             role: Role::Agent,
             last_inited: None,
+            hung_up: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn is_hung_up(&self) -> bool {
+        self.hung_up.load(Ordering::Relaxed)
     }
 }
 
@@ -184,6 +232,11 @@ pub fn handle_request(request: Request, session: &mut Session, daemon: &Daemon) 
     }
     match request {
         Request::Hello { role } => {
+            match (session.role, role) {
+                (Role::Agent, Role::Operator) => daemon.operator_joined(),
+                (Role::Operator, Role::Agent) => daemon.operator_left(),
+                _ => {}
+            }
             session.role = role;
             json!({"ok": true, "role": role})
         }
@@ -346,22 +399,26 @@ pub fn handle_request(request: Request, session: &mut Session, daemon: &Daemon) 
             if pads.is_empty() {
                 return err("bad_args", "claim needs gamepad1, gamepad2 or both");
             }
-            match gamepad::claim(&daemon.gamepads, session.role, &pads, |g| {
-                daemon.send_gamepad(g)
-            }) {
-                Ok(changes) => {
-                    daemon.announce(&changes);
-                    json!({"ok": true, "held": daemon.gamepads().held_by(session.role)})
-                }
+            match gamepad::claim(
+                &daemon.gamepads,
+                session.role,
+                &pads,
+                |change| daemon.announce(change),
+                |packet| daemon.send_gamepad(packet),
+            ) {
+                Ok(_) => json!({"ok": true, "held": daemon.gamepads().held_by(session.role)}),
                 Err(refusal) => refusal.to_json(),
             }
         }
         Request::Release { pads } => {
             let pads = pads.unwrap_or_else(|| Pad::ALL.to_vec());
-            let changes = gamepad::release(&daemon.gamepads, session.role, &pads, |g| {
-                daemon.send_gamepad(g)
-            });
-            daemon.announce(&changes);
+            let changes = gamepad::release(
+                &daemon.gamepads,
+                session.role,
+                &pads,
+                |change| daemon.announce(change),
+                |packet| daemon.send_gamepad(packet),
+            );
             let released: Vec<Pad> = changes.iter().map(|c| c.pad).collect();
             json!({"ok": true, "released": released})
         }
@@ -377,6 +434,9 @@ pub fn handle_request(request: Request, session: &mut Session, daemon: &Daemon) 
                     format!("a pulse can last at most {MAX_PULSE_MS} ms, not {duration_ms}"),
                 );
             }
+            if let Err(message) = check_input(&input) {
+                return err("bad_args", message);
+            }
             let packet = to_packet(&input, pad);
             match gamepad::pulse(
                 &daemon.gamepads,
@@ -384,6 +444,7 @@ pub fn handle_request(request: Request, session: &mut Session, daemon: &Daemon) 
                 pad,
                 &packet,
                 duration_ms,
+                || session.is_hung_up(),
                 |g| daemon.send_gamepad(g),
             ) {
                 Err(refusal) => refusal.to_json(),
@@ -392,6 +453,10 @@ pub fn handle_request(request: Request, session: &mut Session, daemon: &Daemon) 
                 }
                 Ok(PulseEnd::Superseded { packets }) => {
                     json!({"ok": true, "user": user, "packets": packets, "superseded": true})
+                }
+                // Nobody is left to read this reply; it only keeps the match whole.
+                Ok(PulseEnd::Abandoned { packets }) => {
+                    json!({"ok": true, "user": user, "packets": packets, "abandoned": true})
                 }
                 Ok(PulseEnd::Lost {
                     owner: Some(Role::Operator),
@@ -617,11 +682,15 @@ mod tests {
         assert_eq!(reply["name"], "Foo");
     }
 
-    fn operator() -> Session {
-        Session {
+    /// A session that has said `hello operator`, counted as the daemon's
+    /// connections are.
+    fn operator(daemon: &Daemon) -> Session {
+        let mut session = Session::new();
+        let hello = Request::Hello {
             role: Role::Operator,
-            last_inited: None,
-        }
+        };
+        handle_request(hello, &mut session, daemon);
+        session
     }
 
     fn status_gamepads(daemon: &Daemon) -> Value {
@@ -656,7 +725,10 @@ mod tests {
         let claim = |pads: Vec<Pad>, session: &mut Session| {
             handle_request(Request::Claim { pads }, session, &daemon)
         };
-        assert_eq!(claim(vec![Pad::Gamepad2], &mut operator())["ok"], true);
+        assert_eq!(
+            claim(vec![Pad::Gamepad2], &mut operator(&daemon))["ok"],
+            true
+        );
         let reply = claim(Pad::ALL.to_vec(), &mut Session::new());
         assert_eq!(reply["error"], "preempted");
         assert_eq!(
@@ -681,6 +753,91 @@ mod tests {
         assert_eq!(
             status_gamepads(&daemon),
             json!({"gamepad1": null, "gamepad2": null})
+        );
+    }
+
+    #[test]
+    fn the_last_operator_leaving_releases_its_pads() {
+        let daemon = test_daemon(Duration::from_millis(50));
+        let events = daemon.subscribers.lock().unwrap().subscribe();
+        let first = operator(&daemon);
+        let mut second = operator(&daemon);
+        let claim = Request::Claim {
+            pads: vec![Pad::Gamepad1],
+        };
+        handle_request(claim, &mut second, &daemon);
+
+        daemon.end_session(&second);
+        assert_eq!(
+            status_gamepads(&daemon),
+            json!({"gamepad1": "operator", "gamepad2": null}),
+            "another operator is still connected"
+        );
+        daemon.end_session(&first);
+        assert_eq!(
+            status_gamepads(&daemon),
+            json!({"gamepad1": null, "gamepad2": null})
+        );
+        let released: Vec<Value> = events.try_iter().collect();
+        assert_eq!(
+            released.last(),
+            Some(
+                &json!({"event": "gamepad_owner", "user": 1, "owner": null, "previous": "operator"})
+            )
+        );
+
+        // The agent is no longer locked out.
+        let reply = handle_request(
+            Request::Claim {
+                pads: vec![Pad::Gamepad1],
+            },
+            &mut Session::new(),
+            &daemon,
+        );
+        assert_eq!(reply["ok"], true);
+    }
+
+    #[test]
+    fn a_pulse_stops_once_its_client_hangs_up() {
+        let daemon = test_daemon(Duration::from_millis(50));
+        connected(&daemon);
+        let mut agent = Session::new();
+        let claim = Request::Claim {
+            pads: vec![Pad::Gamepad1],
+        };
+        handle_request(claim, &mut agent, &daemon);
+        let hung_up = agent.hung_up.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            hung_up.store(true, Ordering::Relaxed);
+        });
+        let started = std::time::Instant::now();
+        let request = Request::Gamepad(ds_proto::GamepadInput {
+            left_stick_y: Some(0.5),
+            duration_ms: Some(5_000),
+            ..Default::default()
+        });
+        let reply = handle_request(request, &mut agent, &daemon);
+        assert_eq!(reply["abandoned"], true, "{reply}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn gamepad_values_are_range_checked() {
+        let daemon = test_daemon(Duration::from_millis(50));
+        connected(&daemon);
+        let mut agent = Session::new();
+        let claim = Request::Claim {
+            pads: vec![Pad::Gamepad1],
+        };
+        handle_request(claim, &mut agent, &daemon);
+        let request = Request::Gamepad(ds_proto::GamepadInput {
+            left_stick_y: Some(2.0),
+            ..Default::default()
+        });
+        assert_eq!(
+            handle_request(request, &mut agent, &daemon)["error"],
+            "bad_args"
         );
     }
 
@@ -750,7 +907,7 @@ mod tests {
         });
         assert_eq!(
             handle_request(request, &mut agent, &daemon),
-            json!({"ok": true, "user": 2, "packets": 2})
+            json!({"ok": true, "user": 2, "packets": 3})
         );
     }
 

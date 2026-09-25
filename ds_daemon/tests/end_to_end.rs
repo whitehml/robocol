@@ -264,6 +264,18 @@ fn next_event(
     }
 }
 
+/// Starts `ds_agent <args>` in the background with its output captured,
+/// for requests the test acts on while they run.
+fn spawn_agent(socket_dir: &Path, args: &[&str]) -> Child {
+    Command::new(bin_path("ds_agent"))
+        .args(args)
+        .env("XDG_RUNTIME_DIR", socket_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start ds_agent")
+}
+
 /// A raw operator session on the daemon's socket, standing in for `ds_cli`
 /// (which has its own test).
 struct Operator {
@@ -681,6 +693,7 @@ fn ds_cli_is_an_operator_on_the_same_daemon() {
         for line in [
             "status",
             "claim gamepad1",
+            "status",
             "init",
             "watch --types nope",
             "quit",
@@ -708,6 +721,12 @@ fn ds_cli_is_an_operator_on_the_same_daemon() {
     assert!(
         lines
             .iter()
+            .any(|v| v["gamepads"]["gamepad1"] == "operator"),
+        "the claim was not the operator's while ds_cli ran: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
             .any(|v| v["held"] == serde_json::json!(["gamepad1"])),
         "no claim reply in {lines:?}"
     );
@@ -717,7 +736,128 @@ fn ds_cli_is_an_operator_on_the_same_daemon() {
         "`init` without a name and a bad watch filter: {lines:?}"
     );
 
-    // The operator's claim lives in the daemon, visible from the agent side.
+    // Quitting ds_cli, the last operator, hands its pads back, so the agent
+    // is not locked out by a claim nobody is left to release.
     let status = run_agent_with_env(&tmp, &["status"], &env);
-    assert_eq!(status["gamepads"]["gamepad1"], "operator", "{status}");
+    assert_eq!(
+        status["gamepads"]["gamepad1"],
+        serde_json::Value::Null,
+        "{status}"
+    );
+}
+
+#[test]
+fn gamepad_handovers_survive_packet_loss() {
+    build_bins(&["ds_agent", "fake_rc"]);
+
+    let tmp = tempdir("lossy_");
+    let fake_rc_port: u16 = 20953;
+    // fake_rc drops a fifth of the gamepad packets it receives: every way a
+    // pad returns to rest must survive losing some of them.
+    let mut fake_rc = start_fake_rc(fake_rc_port, &[("FAKE_RC_GAMEPAD_LOSS", "0.2")]);
+    let mut daemon = start_daemon(&tmp, fake_rc_port);
+    wait_connected(&tmp);
+
+    let (watch, events) = watch_events(
+        &tmp,
+        &[
+            "--types",
+            "telemetry",
+            "--tag",
+            "TELEMETRY_DATA",
+            "--key",
+            "gamepad2_left_stick_y",
+        ],
+    );
+    assert!(
+        next_event(&events, Duration::from_secs(3), |e| e["event"]
+            == "telemetry")
+        .is_some(),
+        "the watch never started"
+    );
+    let stick2 =
+        |value: f64| move |e: &serde_json::Value| e["numbers"]["gamepad2_left_stick_y"] == value;
+    let pushed = || {
+        assert!(
+            next_event(&events, Duration::from_secs(3), stick2(0.75)).is_some(),
+            "fake_rc never saw the pulse"
+        )
+    };
+    let at_rest = |after: &str| {
+        assert!(
+            next_event(&events, Duration::from_secs(3), stick2(0.0)).is_some(),
+            "the pad stayed pushed after {after}"
+        )
+    };
+    let long_pulse = [
+        "gamepad",
+        "--user",
+        "2",
+        "--left-stick-y",
+        "0.75",
+        "--duration",
+        "5s",
+    ];
+
+    assert_eq!(run_agent(&tmp, &["claim", "gamepad2"])["ok"], true);
+
+    // A pulse that runs its course ends with its neutral tail.
+    let pulse = run_agent(
+        &tmp,
+        &[
+            "gamepad",
+            "--user",
+            "2",
+            "--left-stick-y",
+            "0.75",
+            "--duration",
+            "300ms",
+        ],
+    );
+    assert_eq!(pulse["ok"], true, "{pulse}");
+    pushed();
+    at_rest("a completed pulse");
+
+    // The operator takes the pad mid-pulse.
+    let taken = spawn_agent(&tmp, &long_pulse);
+    pushed();
+    let mut operator = Operator::connect(&tmp);
+    let took = operator.send(serde_json::json!({"cmd": "claim", "pads": ["gamepad2"]}));
+    assert_eq!(took["ok"], true, "{took}");
+    at_rest("the operator's takeover");
+    wait_within(taken, AGENT_LIMIT).expect("the preempted pulse ended");
+
+    // The operator leaving hands the pad back to whoever claims it next.
+    drop(operator);
+    assert!(
+        wait_until(Duration::from_secs(3), || run_agent(
+            &tmp,
+            &["claim", "gamepad2"]
+        )["ok"]
+            == true),
+        "the pad stayed with an operator that had left"
+    );
+
+    // A client that dies mid-pulse does not leave the pad driving.
+    let mut dying = spawn_agent(&tmp, &long_pulse);
+    pushed();
+    let _ = dying.kill();
+    let _ = dying.wait();
+    at_rest("its client died mid-pulse");
+
+    // Releasing mid-pulse returns the pad to rest too.
+    let released = spawn_agent(&tmp, &long_pulse);
+    pushed();
+    let reply = run_agent(&tmp, &["release", "gamepad2"]);
+    assert_eq!(
+        reply["released"],
+        serde_json::json!(["gamepad2"]),
+        "{reply}"
+    );
+    at_rest("a release mid-pulse");
+    wait_within(released, AGENT_LIMIT).expect("the released pulse ended");
+
+    drop(watch);
+    shut_down(&tmp, &mut daemon);
+    let _ = fake_rc.0.kill();
 }
