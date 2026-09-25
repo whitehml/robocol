@@ -12,6 +12,7 @@
 //! At the prompt: any verb (`help` lists them), `watch [--types ..] [--tag
 //! ..] [--key ..]` to narrow the live events shown, and `quit`.
 
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
 use ds_proto::{PARSE_TABLE, Request, Role, WatchFilter, parse, render, split_line, transport};
@@ -35,6 +36,8 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--json" => args.json = true,
             "--peer" => {
                 let ip = rest.next().ok_or("--peer needs an IP address")?;
+                ip.parse::<IpAddr>()
+                    .map_err(|_| format!("--peer: not an IP address: {ip}"))?;
                 args.peer = Some(ip.clone());
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -54,6 +57,10 @@ fn format_line(value: &Value, json: bool) -> String {
 
 fn bad_args(message: impl Into<String>) -> Value {
     json!({"ok": false, "error": "bad_args", "message": message.into()})
+}
+
+fn unreachable(message: impl Into<String>) -> Value {
+    json!({"ok": false, "error": "daemon_unreachable", "message": message.into()})
 }
 
 fn help() -> String {
@@ -114,7 +121,8 @@ fn main() {
             let mut last_telemetry = String::new();
             loop {
                 let Ok(Some(event)) = events.recv() else {
-                    print_event("!! lost the event stream from ds_daemon".to_string());
+                    let lost = unreachable("lost the event stream from ds_daemon");
+                    print_event(format_line(&lost, json));
                     return;
                 };
                 let shown = filter.lock().expect("filter mutex poisoned").apply(&event);
@@ -167,15 +175,20 @@ fn main() {
         let request = match parse(&words) {
             Ok(request) => request,
             Err(e) => {
-                println!("{}", format_line(&bad_args(e), args.json));
+                let known = PARSE_TABLE.iter().any(|verb| verb.name == words[0]);
+                let hint = if known { "" } else { " (`help` lists them)" };
+                println!(
+                    "{}",
+                    format_line(&bad_args(format!("{e}{hint}")), args.json)
+                );
                 continue;
             }
         };
         match session.request(&request) {
             Ok(reply) => println!("{}", format_line(&reply, args.json)),
             Err(e) => {
-                println!("!! daemon_unreachable: {e}");
-                break;
+                println!("{}", format_line(&unreachable(e.to_string()), args.json));
+                std::process::exit(1);
             }
         }
         if request == Request::Shutdown {
@@ -209,6 +222,7 @@ mod tests {
             })
         );
         assert!(args(&["--peer"]).is_err());
+        assert!(args(&["--peer", "10.0.0"]).is_err());
         assert!(args(&["10.0.0.5"]).is_err());
     }
 

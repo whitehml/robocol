@@ -7,9 +7,14 @@
 pub mod filter;
 pub mod render;
 pub mod request;
+/// Unix domain sockets: the only transport so far. Gated so the rest of the
+/// crate still builds where a future front end (say, Deck Station on
+/// Windows) would need another.
+#[cfg(unix)]
 pub mod transport;
 
 pub use filter::WatchFilter;
 pub use render::render;
 pub use request::{GamepadInput, PARSE_TABLE, Pad, Request, Role, Verb, parse, split_line};
+#[cfg(unix)]
 pub use transport::{read_message, socket_path, write_message};

@@ -31,18 +31,21 @@ fn main() {
         .skip(usize::from(pretty))
         .map(String::as_str)
         .collect();
+    let out = Output { pretty };
     if words.is_empty() {
-        eprintln!("{}", usage());
-        std::process::exit(2);
+        out.usage_error(&usage());
     }
     let request = match parse(&words) {
         Ok(request) => request,
-        Err(msg) => {
-            eprintln!("{msg}");
-            std::process::exit(2);
+        Err(msg)
+            if ds_proto::PARSE_TABLE
+                .iter()
+                .any(|verb| verb.name == words[0]) =>
+        {
+            out.usage_error(&msg)
         }
+        Err(msg) => out.usage_error(&format!("{msg}\n{}", usage())),
     };
-    let out = Output { pretty };
     let code = match request {
         Request::Ping | Request::Shutdown => run_without_spawning(&request, out),
         Request::Watch => {
@@ -78,6 +81,15 @@ impl Output {
             value.to_string()
         };
         writeln!(std::io::stdout().lock(), "{line}")
+    }
+
+    /// Reports a usage error as `bad_args` on stdout, like any other error,
+    /// with the plain message on stderr, and exits 2.
+    fn usage_error(self, message: &str) -> ! {
+        let error = json!({"ok": false, "error": "bad_args", "message": message});
+        let _ = self.print(&error);
+        eprintln!("{message}");
+        std::process::exit(2);
     }
 
     /// Reports `daemon_unreachable` on stdout for the caller, and as JSON on
@@ -134,8 +146,9 @@ fn run_without_spawning(request: &Request, out: Output) -> i32 {
     }
 }
 
-/// Prints each event that passes `filter` until the daemon goes away or
-/// stdout is closed.
+/// Prints each event that passes `filter`. Ends with 0 when stdout is closed
+/// (`ds_agent watch | head`), and with `daemon_unreachable` and 1 when the
+/// daemon goes away.
 fn run_watch(filter: &WatchFilter, out: Output) -> i32 {
     let mut conn = match transport::connect_or_spawn(Role::Agent, &[]) {
         Ok(conn) => conn,
@@ -144,12 +157,17 @@ fn run_watch(filter: &WatchFilter, out: Output) -> i32 {
     if let Err(e) = conn.send(&Request::Watch) {
         return out.unreachable(&format!("ds_daemon did not accept watch: {e}"));
     }
-    while let Ok(Some(event)) = conn.recv() {
-        if let Some(shown) = filter.apply(&event)
-            && out.print(&shown).is_err()
-        {
-            break;
+    loop {
+        match conn.recv() {
+            Ok(Some(event)) => {
+                if let Some(shown) = filter.apply(&event)
+                    && out.print(&shown).is_err()
+                {
+                    return 0;
+                }
+            }
+            Ok(None) => return out.unreachable("ds_daemon closed the event stream"),
+            Err(e) => return out.unreachable(&format!("lost the event stream: {e}")),
         }
     }
-    0
 }

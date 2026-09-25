@@ -4,6 +4,7 @@
 
 use std::ffi::OsStr;
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -18,21 +19,34 @@ use crate::request::{Request, Role};
 const SPAWN_WAIT: Duration = Duration::from_secs(3);
 /// How much of the daemon's log to quote when it dies while starting.
 const LOG_TAIL_LINES: usize = 5;
+/// Longest a request waits for its reply before giving up on the daemon:
+/// well past the longest pulse (10 s) or RC wait (5 s by default).
+const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long to wait for a daemon that broke off the handshake to exit.
 const EXIT_GRACE: Duration = Duration::from_millis(500);
 
-/// Where `ds_daemon` listens. Prefers `$XDG_RUNTIME_DIR` (cleaned up by the
-/// OS on logout); falls back to a per-user path under `/tmp` so this also
-/// works in a plain SSH session.
+/// Where `ds_daemon` listens. Prefers `$XDG_RUNTIME_DIR` (per user, cleaned
+/// up by the OS on logout). macOS has none, but its `$TMPDIR` is private to
+/// the user and short enough for a socket path. Otherwise a per-user name
+/// under `/tmp`, so this also works in a plain SSH session.
 pub fn socket_path() -> PathBuf {
     let uid = unsafe { libc::getuid() };
-    socket_path_for(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), uid)
+    let private_tmp = if cfg!(target_os = "macos") {
+        std::env::var_os("TMPDIR").filter(|dir| !dir.is_empty())
+    } else {
+        None
+    };
+    socket_path_for(
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        private_tmp.as_deref(),
+        uid,
+    )
 }
 
-fn socket_path_for(runtime_dir: Option<&OsStr>, uid: u32) -> PathBuf {
-    match runtime_dir {
-        Some(dir) => PathBuf::from(dir).join("ds_daemon.sock"),
-        None => PathBuf::from(format!("/tmp/ds_daemon-{uid}.sock")),
+fn socket_path_for(runtime_dir: Option<&OsStr>, private_tmp: Option<&OsStr>, uid: u32) -> PathBuf {
+    match (runtime_dir, private_tmp) {
+        (Some(dir), _) | (None, Some(dir)) => PathBuf::from(dir).join("ds_daemon.sock"),
+        (None, None) => PathBuf::from(format!("/tmp/ds_daemon-{uid}.sock")),
     }
 }
 
@@ -77,6 +91,10 @@ pub struct Connection {
 
 impl Connection {
     fn new(stream: UnixStream) -> io::Result<Connection> {
+        // Replies are bounded, so a wedged daemon cannot hang the caller.
+        // Set now, while the daemon is surely there: macOS refuses socket
+        // options once the peer has closed (as after `shutdown`).
+        stream.set_read_timeout(Some(REPLY_TIMEOUT))?;
         Ok(Connection {
             reader: BufReader::new(stream.try_clone()?),
             writer: stream,
@@ -84,6 +102,10 @@ impl Connection {
     }
 
     pub fn send(&mut self, request: &Request) -> io::Result<()> {
+        if *request == Request::Watch {
+            // An event stream may stay quiet for as long as it likes.
+            self.writer.set_read_timeout(None)?;
+        }
         let value = serde_json::to_value(request).map_err(io::Error::other)?;
         write_message(&mut self.writer, &value)
     }
@@ -102,12 +124,28 @@ impl Connection {
     /// Sends `request` and waits for its one reply.
     pub fn request(&mut self, request: &Request) -> io::Result<Value> {
         self.send(request)?;
-        self.recv()?.ok_or_else(|| {
-            io::Error::new(
+        match self.recv() {
+            Ok(Some(reply)) => Ok(reply),
+            Ok(None) => Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "ds_daemon closed the connection without replying",
-            )
-        })
+            )),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "ds_daemon did not answer within {} s",
+                        REPLY_TIMEOUT.as_secs()
+                    ),
+                ))
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -195,10 +233,13 @@ fn spawn_daemon(extra_args: &[String]) -> Result<Child, String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate ds_daemon: {e}"))?;
     let daemon = exe.with_file_name("ds_daemon");
     let log = log_path();
+    // O_NOFOLLOW: under a shared /tmp, someone else's symlink must not make
+    // the daemon append its log to their chosen file.
     let open_log = || {
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&log)
             .map_err(|e| format!("cannot open {}: {e}", log.display()))
     };
@@ -264,15 +305,37 @@ mod tests {
     }
 
     #[test]
-    fn socket_path_prefers_the_runtime_dir() {
+    fn socket_path_prefers_private_dirs() {
+        let runtime = Some(OsStr::new("/run/user/501"));
+        let private_tmp = Some(OsStr::new("/var/folders/xy/T"));
         assert_eq!(
-            socket_path_for(Some(OsStr::new("/run/user/501")), 501),
+            socket_path_for(runtime, private_tmp, 501),
             PathBuf::from("/run/user/501/ds_daemon.sock")
         );
         assert_eq!(
-            socket_path_for(None, 501),
+            socket_path_for(None, private_tmp, 501),
+            PathBuf::from("/var/folders/xy/T/ds_daemon.sock")
+        );
+        assert_eq!(
+            socket_path_for(None, None, 501),
             PathBuf::from("/tmp/ds_daemon-501.sock")
         );
+    }
+
+    #[test]
+    fn a_daemon_that_never_answers_times_out_the_request() {
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let mut conn = Connection::new(ours).unwrap();
+        // A real wait would be REPLY_TIMEOUT; shorten it through the socket.
+        conn.writer
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        conn.send(&Request::Ping).unwrap();
+        let err = conn.recv().unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
     }
 
     #[test]

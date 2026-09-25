@@ -483,7 +483,7 @@ pub fn parse(words: &[&str]) -> Result<Request, String> {
     let row = PARSE_TABLE
         .iter()
         .find(|v| v.name == *verb)
-        .ok_or_else(|| format!("unknown command: {verb} (try `help`)"))?;
+        .ok_or_else(|| format!("unknown command: {verb}"))?;
     (row.parse)(args)
 }
 
@@ -504,7 +504,13 @@ pub fn split_line(line: &str) -> Result<Vec<String>, String> {
     let text_arg = PARSE_TABLE.iter().any(|v| v.name == verb && v.text_arg);
     if text_arg {
         if !rest.is_empty() {
-            words.push(rest.to_string());
+            // Quoting is optional: `init "Duo (TeleOp)"` names the same
+            // opmode as `init Duo (TeleOp)`.
+            let unquoted = rest
+                .strip_prefix('"')
+                .and_then(|r| r.strip_suffix('"'))
+                .unwrap_or(rest);
+            words.push(unquoted.to_string());
         }
     } else {
         words.extend(split_words(rest)?);
@@ -706,7 +712,7 @@ mod tests {
     fn unknown_and_empty_commands_are_errors() {
         assert!(parse(&[]).is_err());
         let err = parse(&["fly"]).unwrap_err();
-        assert!(err.contains("help"), "{err}");
+        assert!(err.contains("fly"), "{err}");
     }
 
     #[test]
@@ -751,7 +757,7 @@ mod tests {
             vec!["save-config", r#"{"name": "two  spaces"}"#]
         );
         assert_eq!(
-            split_line("  init Duo (TeleOp) ").unwrap(),
+            split_line(r#"  init "Duo (TeleOp)" "#).unwrap(),
             vec!["init", "Duo (TeleOp)"]
         );
         assert_eq!(split_line("   ").unwrap(), Vec::<String>::new());
