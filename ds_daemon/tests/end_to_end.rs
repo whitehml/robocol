@@ -4,7 +4,7 @@
 //! The two tests here use different runtime dirs and UDP ports, so cargo may
 //! run them in parallel.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -71,10 +71,34 @@ fn run_agent(socket_dir: &Path, args: &[&str]) -> serde_json::Value {
     run_agent_with_env(socket_dir, args, &[])
 }
 
-fn tempdir(tag: &str) -> PathBuf {
+/// A test's private runtime dir (socket and log), under `/tmp` because
+/// macOS caps a socket path near 104 bytes. Removed on drop, so a failing
+/// test leaves nothing behind.
+struct TempDir(PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for TempDir {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_os_str()
+    }
+}
+
+fn tempdir(tag: &str) -> TempDir {
     let dir = PathBuf::from(format!("/tmp/ds_agent_e2e_{tag}{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp runtime dir");
-    dir
+    TempDir(dir)
 }
 
 /// Polls `cond` every 50 ms until it holds or `limit` elapses.
@@ -158,6 +182,82 @@ fn shut_down(socket_dir: &Path, daemon: &mut ChildGuard) {
     );
 }
 
+/// Runs `ds_agent watch <args>` and streams its JSON lines into a channel,
+/// so a test can wait for particular events with a timeout. The guard kills
+/// the watch, which ends the reader thread.
+fn watch_events(
+    socket_dir: &Path,
+    args: &[&str],
+) -> (ChildGuard, mpsc::Receiver<serde_json::Value>) {
+    let mut watch = ChildGuard(
+        Command::new(bin_path("ds_agent"))
+            .arg("watch")
+            .args(args)
+            .env("XDG_RUNTIME_DIR", socket_dir)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("start ds_agent watch"),
+    );
+    let stdout = watch.0.stdout.take().expect("watch stdout");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if let Ok(event) = serde_json::from_str(&line)
+                && tx.send(event).is_err()
+            {
+                break;
+            }
+        }
+    });
+    (watch, rx)
+}
+
+/// The first event within `limit` that `wanted` accepts, skipping others.
+fn next_event(
+    events: &mpsc::Receiver<serde_json::Value>,
+    limit: Duration,
+    wanted: impl Fn(&serde_json::Value) -> bool,
+) -> Option<serde_json::Value> {
+    let deadline = Instant::now() + limit;
+    loop {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        match events.recv_timeout(left) {
+            Ok(event) if wanted(&event) => return Some(event),
+            Ok(_) => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
+/// A raw operator session on the daemon's socket, standing in for `ds_cli`
+/// (which has its own test).
+struct Operator {
+    reader: BufReader<UnixStream>,
+    writer: UnixStream,
+}
+
+impl Operator {
+    fn connect(socket_dir: &Path) -> Operator {
+        let stream =
+            UnixStream::connect(socket_dir.join("ds_daemon.sock")).expect("connect as operator");
+        let mut operator = Operator {
+            reader: BufReader::new(stream.try_clone().unwrap()),
+            writer: stream,
+        };
+        let hello = operator.send(serde_json::json!({"cmd": "hello", "role": "operator"}));
+        assert_eq!(hello["ok"], true, "hello: {hello}");
+        operator
+    }
+
+    fn send(&mut self, request: serde_json::Value) -> serde_json::Value {
+        writeln!(self.writer, "{request}").expect("write to the daemon");
+        let mut line = String::new();
+        self.reader.read_line(&mut line).expect("read the reply");
+        serde_json::from_str(&line).expect("reply is JSON")
+    }
+}
+
 #[test]
 fn drives_an_opmode_and_watches_telemetry_against_fake_rc() {
     build_bins(&["ds_agent", "fake_rc"]);
@@ -232,8 +332,6 @@ fn drives_an_opmode_and_watches_telemetry_against_fake_rc() {
     // proves the shutdown command itself works.
     shut_down(&tmp, &mut daemon);
     let _ = fake_rc.0.kill();
-
-    std::fs::remove_dir_all(&tmp).expect("clean up runtime dir");
 }
 
 /// Tears down whatever `ds_agent` auto-spawned even if the test panics
@@ -269,7 +367,7 @@ fn auto_spawns_daemon_logs_it_and_stops_it() {
         "--peer 127.0.0.1 --peer-port 1 --bind-port 0",
     )];
     let guard = SpawnedDaemonGuard {
-        dir: tmp.clone(),
+        dir: tmp.to_path_buf(),
         env: env.clone(),
     };
 
@@ -332,8 +430,6 @@ fn a_daemon_that_dies_on_startup_is_explained() {
         !tmp.join("ds_daemon.sock").exists(),
         "a daemon that failed to start left its socket behind"
     );
-
-    std::fs::remove_dir_all(&tmp).expect("clean up runtime dir");
 }
 
 #[test]
@@ -370,5 +466,156 @@ fn a_busy_rc_is_reported_until_connect() {
 
     shut_down(&tmp, &mut daemon);
     let _ = fake_rc.0.kill();
-    std::fs::remove_dir_all(&tmp).expect("clean up runtime dir");
+}
+
+#[test]
+fn gamepad_ownership_and_pulses_against_fake_rc() {
+    build_bins(&["ds_agent", "fake_rc"]);
+
+    let tmp = tempdir("pads_");
+    let fake_rc_port: u16 = 20952;
+    let mut fake_rc = start_fake_rc(fake_rc_port, &[]);
+    let mut daemon = start_daemon(&tmp, fake_rc_port);
+    wait_connected(&tmp);
+
+    // fake_rc echoes what it last received on each pad in its telemetry.
+    let (watch, events) = watch_events(
+        &tmp,
+        &[
+            "--types",
+            "telemetry,gamepad_owner",
+            "--tag",
+            "TELEMETRY_DATA",
+            "--key",
+            "gamepad2_left_stick_y",
+        ],
+    );
+    let stick2 =
+        |value: f64| move |e: &serde_json::Value| e["numbers"]["gamepad2_left_stick_y"] == value;
+    let owner_event = |owner: &'static str, previous: serde_json::Value| {
+        move |e: &serde_json::Value| {
+            e["event"] == "gamepad_owner"
+                && e["user"] == 2
+                && e["owner"] == owner
+                && e["previous"] == previous
+        }
+    };
+
+    // Telemetry arriving proves the watch has subscribed, so no event
+    // below can slip past it.
+    assert!(
+        next_event(&events, Duration::from_secs(3), |e| e["event"]
+            == "telemetry")
+        .is_some(),
+        "the watch never started"
+    );
+
+    let claimed = run_agent(&tmp, &["claim", "gamepad2"]);
+    assert_eq!(
+        claimed,
+        serde_json::json!({"ok": true, "held": ["gamepad2"]})
+    );
+    assert!(
+        next_event(
+            &events,
+            Duration::from_secs(3),
+            owner_event("agent", serde_json::Value::Null)
+        )
+        .is_some()
+    );
+
+    let pulse = run_agent(
+        &tmp,
+        &[
+            "gamepad",
+            "--user",
+            "2",
+            "--left-stick-y",
+            "-0.5",
+            "--duration",
+            "600ms",
+        ],
+    );
+    assert_eq!(
+        pulse,
+        serde_json::json!({"ok": true, "user": 2, "packets": 30})
+    );
+    assert!(
+        next_event(&events, Duration::from_secs(3), stick2(-0.5)).is_some(),
+        "fake_rc never saw the pulse"
+    );
+    assert!(
+        next_event(&events, Duration::from_secs(3), stick2(0.0)).is_some(),
+        "the stick never came back to rest after the pulse"
+    );
+
+    // The operator takes the pad in the middle of a long agent pulse: the
+    // pulse ends early with `preempted`, and the pad goes back to rest.
+    let long_pulse = Command::new(bin_path("ds_agent"))
+        .args([
+            "gamepad",
+            "--user",
+            "2",
+            "--left-stick-y",
+            "0.75",
+            "--duration",
+            "5s",
+        ])
+        .env("XDG_RUNTIME_DIR", &tmp)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start a long pulse");
+    assert!(
+        next_event(&events, Duration::from_secs(3), stick2(0.75)).is_some(),
+        "fake_rc never saw the long pulse"
+    );
+    let mut operator = Operator::connect(&tmp);
+    let took = operator.send(serde_json::json!({"cmd": "claim", "pads": ["gamepad1", "gamepad2"]}));
+    assert_eq!(
+        took["held"],
+        serde_json::json!(["gamepad1", "gamepad2"]),
+        "claim: {took}"
+    );
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(long_pulse.wait_with_output());
+    });
+    let output = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the agent's pulse kept running after the operator took the pad")
+        .expect("wait for the long pulse");
+    let reply: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON reply");
+    assert_eq!(reply["error"], "preempted", "long pulse: {reply}");
+    assert!(
+        next_event(
+            &events,
+            Duration::from_secs(3),
+            owner_event("operator", "agent".into())
+        )
+        .is_some()
+    );
+    assert!(
+        next_event(&events, Duration::from_secs(3), stick2(0.0)).is_some(),
+        "the operator inherited a pushed stick"
+    );
+
+    // While the operator holds the pads the agent is refused, and says so.
+    let refused = run_agent(&tmp, &["gamepad", "--user", "2", "--a", "true"]);
+    assert_eq!(refused["error"], "preempted", "{refused}");
+    assert_eq!(
+        run_agent(&tmp, &["claim", "gamepad2"])["error"],
+        "preempted"
+    );
+
+    let released = operator.send(serde_json::json!({"cmd": "release"}));
+    assert_eq!(
+        released["released"],
+        serde_json::json!(["gamepad1", "gamepad2"])
+    );
+    assert_eq!(run_agent(&tmp, &["claim", "gamepad2"])["ok"], true);
+
+    drop(operator);
+    drop(watch);
+    shut_down(&tmp, &mut daemon);
+    let _ = fake_rc.0.kill();
 }

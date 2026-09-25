@@ -18,6 +18,8 @@
 //! Exit status: 0 when the reply has `"ok": true`, 1 otherwise, 2 for a
 //! usage error.
 
+use std::io::Write;
+
 use ds_proto::{Request, Role, WatchFilter, parse, render, transport};
 use serde_json::{Value, json};
 
@@ -67,12 +69,15 @@ struct Output {
 }
 
 impl Output {
-    fn print(self, value: &Value) {
-        if self.pretty {
-            println!("{}", render(value));
+    /// Prints one reply or event. Fails only when stdout is gone (a closed
+    /// pipe, as in `ds_agent watch | head`).
+    fn print(self, value: &Value) -> std::io::Result<()> {
+        let line = if self.pretty {
+            render(value)
         } else {
-            println!("{value}");
-        }
+            value.to_string()
+        };
+        writeln!(std::io::stdout().lock(), "{line}")
     }
 
     /// Reports `daemon_unreachable` on stdout for the caller, and as JSON on
@@ -80,7 +85,7 @@ impl Output {
     /// exit status.
     fn unreachable(self, message: &str) -> i32 {
         let error = json!({"ok": false, "error": "daemon_unreachable", "message": message});
-        self.print(&error);
+        let _ = self.print(&error);
         eprintln!("{error}");
         1
     }
@@ -97,7 +102,7 @@ fn run_one(request: &Request, out: Output) -> i32 {
     };
     match conn.request(request) {
         Ok(reply) => {
-            out.print(&reply);
+            let _ = out.print(&reply);
             exit_code(&reply)
         }
         Err(e) => out.unreachable(&format!("ds_daemon did not answer: {e}")),
@@ -110,7 +115,7 @@ fn run_without_spawning(request: &Request, out: Output) -> i32 {
     let mut conn = match transport::connect_existing(Role::Agent) {
         Ok(Some(conn)) => conn,
         Ok(None) => {
-            out.print(&json!({"ok": true, "running": false}));
+            let _ = out.print(&json!({"ok": true, "running": false}));
             return 0;
         }
         Err(msg) => return out.unreachable(&msg),
@@ -122,14 +127,15 @@ fn run_without_spawning(request: &Request, out: Output) -> i32 {
             {
                 fields.insert("running".into(), Value::Bool(true));
             }
-            out.print(&reply);
+            let _ = out.print(&reply);
             exit_code(&reply)
         }
         Err(e) => out.unreachable(&format!("ds_daemon did not answer: {e}")),
     }
 }
 
-/// Prints each event that passes `filter` until the daemon goes away.
+/// Prints each event that passes `filter` until the daemon goes away or
+/// stdout is closed.
 fn run_watch(filter: &WatchFilter, out: Output) -> i32 {
     let mut conn = match transport::connect_or_spawn(Role::Agent, &[]) {
         Ok(conn) => conn,
@@ -139,8 +145,10 @@ fn run_watch(filter: &WatchFilter, out: Output) -> i32 {
         return out.unreachable(&format!("ds_daemon did not accept watch: {e}"));
     }
     while let Ok(Some(event)) = conn.recv() {
-        if let Some(shown) = filter.apply(&event) {
-            out.print(&shown);
+        if let Some(shown) = filter.apply(&event)
+            && out.print(&shown).is_err()
+        {
+            break;
         }
     }
     0
