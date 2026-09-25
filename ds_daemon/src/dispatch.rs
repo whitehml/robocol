@@ -17,7 +17,7 @@ use crate::gamepad::{
     to_packet,
 };
 use crate::state::DaemonState;
-use crate::waiters::{Subscribers, WaiterKind, WaiterPredicate, WaiterRegistry};
+use crate::waiters::{Subscribers, WAITER_KINDS, WaiterKind, WaiterPredicate, WaiterRegistry};
 
 /// Everything a request can touch, shared by every connection.
 pub struct Daemon {
@@ -31,6 +31,11 @@ pub struct Daemon {
     /// are released; otherwise they would lock the agent out with nobody
     /// left to release them.
     operators: Mutex<usize>,
+    /// One request in flight per kind of reply, by `WaiterKind as usize`.
+    /// Most replies carry nothing that says which request they answer, so
+    /// two `config` requests (say, the operator's and the agent's) in flight
+    /// at once could each get the other's reply.
+    turns: [Mutex<()>; WAITER_KINDS],
     /// How long a request waits for the RC's answer.
     pub timeout: Duration,
 }
@@ -44,6 +49,7 @@ impl Daemon {
             subscribers: Mutex::new(Subscribers::new()),
             gamepads: Mutex::new(Arbiter::default()),
             operators: Mutex::new(0),
+            turns: std::array::from_fn(|_| Mutex::new(())),
             timeout,
         }
     }
@@ -205,15 +211,20 @@ fn known_config(daemon: &Daemon, name: &str) -> Result<ConfigMeta, Value> {
     })
 }
 
-/// Registers a waiter for `kind` events accepted by `pred`, runs `send`
-/// (which must issue exactly one `robocol` request), and blocks up to the
-/// daemon's timeout for the matching event. No lock is held while waiting.
+/// Waits for this kind of request's turn, registers a waiter for `kind`
+/// events accepted by `pred`, runs `send` (which must issue exactly one
+/// `robocol` request), and blocks up to the daemon's timeout for the
+/// matching event. Only the turn is held while waiting: it serializes
+/// requests of one kind and nothing else.
 fn wait_for_event(
     daemon: &Daemon,
     kind: WaiterKind,
     pred: WaiterPredicate,
     send: impl FnOnce(&RobocolClient),
 ) -> Result<Event, Value> {
+    let _turn = daemon.turns[kind as usize]
+        .lock()
+        .expect("turn mutex poisoned");
     let (id, rx) = daemon.waiters().register(kind, pred);
     send(&daemon.client());
     rx.recv_timeout(daemon.timeout).map_err(|_| {
@@ -909,6 +920,38 @@ mod tests {
             handle_request(request, &mut agent, &daemon),
             json!({"ok": true, "user": 2, "packets": 3})
         );
+    }
+
+    #[test]
+    fn same_kind_requests_take_turns_and_get_their_own_replies() {
+        let daemon = test_daemon(Duration::from_secs(2));
+        connected(&daemon);
+        let asks: Vec<_> = (0..2)
+            .map(|_| {
+                let daemon = daemon.clone();
+                std::thread::spawn(move || {
+                    handle_request(Request::ActiveConfig, &mut Session::new(), &daemon)
+                })
+            })
+            .collect();
+        // Play the RC: answer each request as it registers. Two in flight at
+        // once would both take the first answer.
+        for config in ["A", "B"] {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while daemon.waiters().len() == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(daemon.waiters().len(), 1, "requests of one kind overlapped");
+            daemon
+                .waiters()
+                .resolve(&Event::ActiveConfiguration(config.into()));
+        }
+        let mut configs: Vec<Value> = asks
+            .into_iter()
+            .map(|ask| ask.join().unwrap()["config"].clone())
+            .collect();
+        configs.sort_by_key(|c| c.to_string());
+        assert_eq!(configs, vec![json!("A"), json!("B")]);
     }
 
     #[test]

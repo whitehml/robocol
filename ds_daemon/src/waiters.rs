@@ -9,6 +9,9 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use robocol::client::Event;
 use serde_json::Value;
 
+/// How many `WaiterKind`s there are, for tables indexed by `kind as usize`.
+pub const WAITER_KINDS: usize = 9;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaiterKind {
     OpModeList,
@@ -25,6 +28,9 @@ pub enum WaiterKind {
     /// a `|_| true` predicate).
     LynxModules,
 }
+
+// A new last variant must bump `WAITER_KINDS`, or indexing by it panics.
+const _: () = assert!(WaiterKind::LynxModules as usize + 1 == WAITER_KINDS);
 
 pub fn waiter_kind_of(event: &Event) -> Option<WaiterKind> {
     match event {
