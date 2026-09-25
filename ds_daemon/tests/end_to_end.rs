@@ -51,13 +51,47 @@ fn bin_path(name: &str) -> PathBuf {
     path
 }
 
+/// Longest a single `ds_agent` call may take in these tests.
+const AGENT_LIMIT: Duration = Duration::from_secs(20);
+
+/// Waits for `child` to exit and collects its output, killing it if that
+/// takes longer than `limit`; `None` on timeout. A child that never finishes
+/// must fail the test rather than hang the run: on macOS, a freshly built
+/// binary can stall at launch while the system assesses it.
+fn wait_within(child: Child, limit: Duration) -> Option<std::process::Output> {
+    let pid = child.id();
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(child.wait_with_output());
+    });
+    match done_rx.recv_timeout(limit) {
+        Ok(output) => Some(output.expect("wait for a child process")),
+        Err(_) => {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            None
+        }
+    }
+}
+
+/// Runs `command` with its output captured, failing the test if it takes
+/// longer than `limit`.
+fn output_within(mut command: Command, limit: Duration) -> std::process::Output {
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("start {command:?}: {e}"));
+    wait_within(child, limit)
+        .unwrap_or_else(|| panic!("{command:?} did not finish within {limit:?}"))
+}
+
 fn run_agent_with_env(socket_dir: &Path, args: &[&str], env: &[(&str, &str)]) -> serde_json::Value {
-    let output = Command::new(bin_path("ds_agent"))
+    let mut command = Command::new(bin_path("ds_agent"));
+    command
         .args(args)
         .env("XDG_RUNTIME_DIR", socket_dir)
-        .envs(env.iter().copied())
-        .output()
-        .expect("run ds_agent");
+        .envs(env.iter().copied());
+    let output = output_within(command, AGENT_LIMIT);
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
         panic!(
@@ -288,11 +322,11 @@ fn drives_an_opmode_and_watches_telemetry_against_fake_rc() {
     let stop = run_agent(&tmp, &["stop"]);
     assert_eq!(stop["ok"], true);
 
-    let pretty = Command::new(bin_path("ds_agent"))
+    let mut pretty = Command::new(bin_path("ds_agent"));
+    pretty
         .args(["--pretty", "status"])
-        .env("XDG_RUNTIME_DIR", &tmp)
-        .output()
-        .expect("run ds_agent --pretty");
+        .env("XDG_RUNTIME_DIR", &tmp);
+    let pretty = output_within(pretty, AGENT_LIMIT);
     let text = String::from_utf8_lossy(&pretty.stdout);
     assert!(text.contains("connected: true"), "--pretty status: {text}");
 
@@ -344,13 +378,16 @@ struct SpawnedDaemonGuard {
 
 impl Drop for SpawnedDaemonGuard {
     fn drop(&mut self) {
-        let _ = Command::new(bin_path("ds_agent"))
+        let shutdown = Command::new(bin_path("ds_agent"))
             .arg("shutdown")
             .env("XDG_RUNTIME_DIR", &self.dir)
             .envs(self.env.iter().copied())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .spawn();
+        if let Ok(child) = shutdown {
+            let _ = wait_within(child, AGENT_LIMIT);
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -411,12 +448,12 @@ fn a_daemon_that_dies_on_startup_is_explained() {
     let port = held.local_addr().unwrap().port();
     let args = format!("--peer 127.0.0.1 --peer-port 1 --bind-port {port}");
 
-    let output = Command::new(bin_path("ds_agent"))
+    let mut status = Command::new(bin_path("ds_agent"));
+    status
         .arg("status")
         .env("XDG_RUNTIME_DIR", &tmp)
-        .env("DS_DAEMON_ARGS", &args)
-        .output()
-        .expect("run ds_agent");
+        .env("DS_DAEMON_ARGS", &args);
+    let output = output_within(status, AGENT_LIMIT);
     assert_eq!(output.status.code(), Some(1));
     let reply: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("ds_agent printed JSON");
@@ -576,14 +613,8 @@ fn gamepad_ownership_and_pulses_against_fake_rc() {
         serde_json::json!(["gamepad1", "gamepad2"]),
         "claim: {took}"
     );
-    let (done_tx, done_rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = done_tx.send(long_pulse.wait_with_output());
-    });
-    let output = done_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("the agent's pulse kept running after the operator took the pad")
-        .expect("wait for the long pulse");
+    let output = wait_within(long_pulse, Duration::from_secs(2))
+        .expect("the agent's pulse kept running after the operator took the pad");
     let reply: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON reply");
     assert_eq!(reply["error"], "preempted", "long pulse: {reply}");
     assert!(
@@ -657,14 +688,7 @@ fn ds_cli_is_an_operator_on_the_same_daemon() {
             writeln!(stdin, "{line}").expect("type into ds_cli");
         }
     }
-    let (done_tx, done_rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = done_tx.send(cli.wait_with_output());
-    });
-    let output = done_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("ds_cli did not quit")
-        .expect("wait for ds_cli");
+    let output = wait_within(cli, Duration::from_secs(10)).expect("ds_cli did not quit");
     assert!(
         output.status.success(),
         "ds_cli exited with {}",
