@@ -1,8 +1,10 @@
 //! Drives the full `ds_agent` -> `ds_daemon` -> `fake_rc` stack the way a
 //! human would drive `ds_cli` -> a real Control Hub, but scripted.
 //!
-//! The two tests here use different runtime dirs and UDP ports, so cargo may
-//! run them in parallel.
+//! The tests here use different runtime dirs and UDP ports, so cargo may run
+//! them in parallel. Waits for a process to start are generous: on macOS the
+//! first launch of a freshly built binary can take seconds while the system
+//! assesses it, and a tight bound turns that into a false failure.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -52,7 +54,9 @@ fn bin_path(name: &str) -> PathBuf {
 }
 
 /// Longest a single `ds_agent` call may take in these tests.
-const AGENT_LIMIT: Duration = Duration::from_secs(20);
+const AGENT_LIMIT: Duration = Duration::from_secs(30);
+/// Longest a process may take to start up (see the module doc).
+const LAUNCH_LIMIT: Duration = Duration::from_secs(20);
 
 /// Waits for `child` to exit and collects its output, killing it if that
 /// takes longer than `limit`; `None` on timeout. A child that never finishes
@@ -185,7 +189,7 @@ fn start_daemon(socket_dir: &Path, rc_port: u16) -> ChildGuard {
     );
     let socket = socket_dir.join("ds_daemon.sock");
     assert!(
-        wait_until(Duration::from_secs(3), || socket.exists()),
+        wait_until(LAUNCH_LIMIT, || socket.exists()),
         "ds_daemon socket never appeared"
     );
     daemon
@@ -194,11 +198,10 @@ fn start_daemon(socket_dir: &Path, rc_port: u16) -> ChildGuard {
 /// Waits for the daemon to finish discovery with its RC.
 fn wait_connected(socket_dir: &Path) {
     assert!(
-        wait_until(Duration::from_secs(3), || run_agent(
-            socket_dir,
-            &["status"]
-        )["connected"]
-            == true),
+        wait_until(
+            LAUNCH_LIMIT,
+            || run_agent(socket_dir, &["status"])["connected"] == true
+        ),
         "ds_daemon never connected to fake_rc"
     );
 }
@@ -287,6 +290,9 @@ impl Operator {
     fn connect(socket_dir: &Path) -> Operator {
         let stream =
             UnixStream::connect(socket_dir.join("ds_daemon.sock")).expect("connect as operator");
+        stream
+            .set_read_timeout(Some(AGENT_LIMIT))
+            .expect("bound the operator's reads");
         let mut operator = Operator {
             reader: BufReader::new(stream.try_clone().unwrap()),
             writer: stream,
@@ -366,7 +372,7 @@ fn drives_an_opmode_and_watches_telemetry_against_fake_rc() {
             let _ = tx.send(reader.read_line(&mut line).map(|_| line));
         });
         let line = rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(LAUNCH_LIMIT)
             .expect("no telemetry line within 5s")
             .expect("read a telemetry line");
         let event: serde_json::Value =
@@ -487,13 +493,14 @@ fn a_busy_rc_is_reported_until_connect() {
 
     let tmp = tempdir("busy_");
     let fake_rc_port: u16 = 20951;
-    // fake_rc acts owned by another driver station for its first 2 s.
-    let mut fake_rc = start_fake_rc(fake_rc_port, &[("FAKE_RC_BUSY", "2")]);
-    let busy_until = Instant::now() + Duration::from_secs(2);
+    // The daemon first, so its discovery is already running when fake_rc
+    // starts; fake_rc then acts owned by another driver station for its
+    // first 3 s, counted from when it actually runs.
     let mut daemon = start_daemon(&tmp, fake_rc_port);
+    let mut fake_rc = start_fake_rc(fake_rc_port, &[("FAKE_RC_BUSY", "3")]);
 
     assert!(
-        wait_until(Duration::from_secs(2), || {
+        wait_until(LAUNCH_LIMIT, || {
             !run_agent(&tmp, &["status"])["peer_busy"].is_null()
         }),
         "the daemon never reported the busy RC"
@@ -502,10 +509,9 @@ fn a_busy_rc_is_reported_until_connect() {
     assert_eq!(list["error"], "peer_busy", "list: {list}");
 
     // Discovery stays paused after the other driver station goes away: the
-    // daemon waits to be told before trying again.
-    std::thread::sleep(
-        busy_until.saturating_duration_since(Instant::now()) + Duration::from_millis(500),
-    );
+    // daemon waits to be told before trying again. The window began before
+    // the busy report above, so it is over 3.5 s after it.
+    std::thread::sleep(Duration::from_millis(3500));
     assert_eq!(run_agent(&tmp, &["status"])["connected"], false);
 
     let connect = run_agent(&tmp, &["connect"]);
@@ -553,9 +559,7 @@ fn gamepad_ownership_and_pulses_against_fake_rc() {
     // Telemetry arriving proves the watch has subscribed, so no event
     // below can slip past it.
     assert!(
-        next_event(&events, Duration::from_secs(3), |e| e["event"]
-            == "telemetry")
-        .is_some(),
+        next_event(&events, LAUNCH_LIMIT, |e| e["event"] == "telemetry").is_some(),
         "the watch never started"
     );
 
@@ -701,7 +705,7 @@ fn ds_cli_is_an_operator_on_the_same_daemon() {
             writeln!(stdin, "{line}").expect("type into ds_cli");
         }
     }
-    let output = wait_within(cli, Duration::from_secs(10)).expect("ds_cli did not quit");
+    let output = wait_within(cli, AGENT_LIMIT).expect("ds_cli did not quit");
     assert!(
         output.status.success(),
         "ds_cli exited with {}",
@@ -770,9 +774,7 @@ fn gamepad_handovers_survive_packet_loss() {
         ],
     );
     assert!(
-        next_event(&events, Duration::from_secs(3), |e| e["event"]
-            == "telemetry")
-        .is_some(),
+        next_event(&events, LAUNCH_LIMIT, |e| e["event"] == "telemetry").is_some(),
         "the watch never started"
     );
     let stick2 =
