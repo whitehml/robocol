@@ -11,5 +11,5 @@ pub mod transport;
 
 pub use filter::WatchFilter;
 pub use render::render;
-pub use request::{GamepadInput, PARSE_TABLE, Request, Role, Verb, parse, split_line};
+pub use request::{GamepadInput, PARSE_TABLE, Pad, Request, Role, Verb, parse, split_line};
 pub use transport::{read_message, socket_path, write_message};

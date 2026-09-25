@@ -9,11 +9,48 @@ use serde::{Deserialize, Serialize};
 
 use crate::filter::WatchFilter;
 
+/// A gamepad slot on the RC: `gamepad1` is `user` 1, `gamepad2` is `user` 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Pad {
+    Gamepad1,
+    Gamepad2,
+}
+
+impl Pad {
+    pub const ALL: [Pad; 2] = [Pad::Gamepad1, Pad::Gamepad2];
+
+    /// The `user` number the RC reads from a gamepad packet.
+    pub fn user(self) -> u8 {
+        match self {
+            Pad::Gamepad1 => 1,
+            Pad::Gamepad2 => 2,
+        }
+    }
+
+    pub fn from_user(user: u8) -> Option<Pad> {
+        match user {
+            1 => Some(Pad::Gamepad1),
+            2 => Some(Pad::Gamepad2),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Pad::Gamepad1 => "gamepad1",
+            Pad::Gamepad2 => "gamepad2",
+        }
+    }
+}
+
 /// Stick, trigger and button values for one gamepad pulse. Anything left
-/// `None` is sent as zero / released.
+/// `None` is sent as zero / released; `user` defaults to 1.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GamepadInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub left_stick_x: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -143,6 +180,13 @@ pub enum Request {
         serial: String,
     },
     Gamepad(GamepadInput),
+    Claim {
+        pads: Vec<Pad>,
+    },
+    Release {
+        #[serde(default)]
+        pads: Option<Vec<Pad>>,
+    },
     Connect,
     Disconnect,
     Watch,
@@ -173,6 +217,8 @@ impl Request {
             Request::Scan => "scan",
             Request::LynxModules { .. } => "lynx-modules",
             Request::Gamepad(_) => "gamepad",
+            Request::Claim { .. } => "claim",
+            Request::Release { .. } => "release",
             Request::Connect => "connect",
             Request::Disconnect => "disconnect",
             Request::Watch => "watch",
@@ -355,9 +401,11 @@ pub const PARSE_TABLE: &[Verb] = &[
     },
     Verb {
         name: "gamepad",
-        usage: "gamepad [--left-stick-y -0.5 ...] [--a true ...] [--duration 300ms]",
+        usage: "gamepad [--user 1|2] [--left-stick-y -0.5 ...] [--a true ...] [--duration 300ms]",
         parse: parse_gamepad,
         example: &[
+            "--user",
+            "2",
             "--left-stick-y",
             "-0.5",
             "--a",
@@ -365,6 +413,31 @@ pub const PARSE_TABLE: &[Verb] = &[
             "--duration",
             "300ms",
         ],
+        text_arg: false,
+    },
+    Verb {
+        name: "claim",
+        usage: "claim gamepad1|gamepad2|both",
+        parse: |a| match a {
+            [pads] => Ok(Request::Claim {
+                pads: parse_pads(pads)?,
+            }),
+            _ => Err("usage: claim gamepad1|gamepad2|both".into()),
+        },
+        example: &["both"],
+        text_arg: false,
+    },
+    Verb {
+        name: "release",
+        usage: "release [gamepad1|gamepad2|both]",
+        parse: |a| match a {
+            [] => Ok(Request::Release { pads: None }),
+            [pads] => Ok(Request::Release {
+                pads: Some(parse_pads(pads)?),
+            }),
+            _ => Err("usage: release [gamepad1|gamepad2|both]".into()),
+        },
+        example: &["gamepad2"],
         text_arg: false,
     },
     Verb {
@@ -471,6 +544,17 @@ fn split_words(s: &str) -> Result<Vec<String>, String> {
     Ok(words)
 }
 
+fn parse_pads(word: &str) -> Result<Vec<Pad>, String> {
+    match word {
+        "gamepad1" => Ok(vec![Pad::Gamepad1]),
+        "gamepad2" => Ok(vec![Pad::Gamepad2]),
+        "both" => Ok(Pad::ALL.to_vec()),
+        other => Err(format!(
+            "expected gamepad1, gamepad2 or both, got {other:?}"
+        )),
+    }
+}
+
 fn parse_role(word: &str) -> Result<Role, String> {
     match word {
         "operator" => Ok(Role::Operator),
@@ -510,7 +594,13 @@ fn parse_gamepad(args: &[&str]) -> Result<Request, String> {
         let value = args
             .get(i + 1)
             .ok_or_else(|| format!("missing value for --{flag}"))?;
-        if flag == "duration" {
+        if flag == "user" {
+            input.user = Some(match *value {
+                "1" => 1,
+                "2" => 2,
+                _ => return Err(format!("--user expects 1 or 2, got {value:?}")),
+            });
+        } else if flag == "duration" {
             input.duration_ms = Some(parse_duration_ms(value)?);
         } else if let Some(slot) = input.axis(&flag) {
             *slot = Some(
@@ -704,6 +794,35 @@ mod tests {
         assert!(parse(&["gamepad", "--a", "yes"]).is_err());
         assert!(parse(&["gamepad", "--a"]).is_err());
         assert!(parse(&["gamepad", "a", "true"]).is_err());
+    }
+
+    #[test]
+    fn gamepad_user_is_one_or_two() {
+        let Ok(Request::Gamepad(input)) = parse(&["gamepad", "--user", "2"]) else {
+            panic!("--user 2 did not parse")
+        };
+        assert_eq!(input.user, Some(2));
+        assert!(parse(&["gamepad", "--user", "3"]).is_err());
+    }
+
+    #[test]
+    fn claim_and_release_name_their_pads() {
+        assert_eq!(
+            parse(&["claim", "both"]),
+            Ok(Request::Claim {
+                pads: vec![Pad::Gamepad1, Pad::Gamepad2]
+            })
+        );
+        assert!(parse(&["claim"]).is_err());
+        assert!(parse(&["claim", "gamepad3"]).is_err());
+        assert_eq!(parse(&["release"]), Ok(Request::Release { pads: None }));
+        assert_eq!(
+            serde_json::to_value(Request::Claim {
+                pads: vec![Pad::Gamepad2]
+            })
+            .unwrap(),
+            json!({"cmd": "claim", "pads": ["gamepad2"]})
+        );
     }
 
     #[test]

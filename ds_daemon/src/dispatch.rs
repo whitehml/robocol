@@ -6,13 +6,14 @@
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use ds_proto::{Request, Role};
+use ds_proto::{Pad, Request, Role};
 use robocol::client::{Event, RobocolClient};
 use robocol::cmd::{ConfigMeta, parse_config_list};
-use robocol::packets::Gamepad;
 use serde_json::{Value, json};
 
-use crate::gamepad::to_packet;
+use crate::gamepad::{
+    self, Arbiter, DEFAULT_PULSE_MS, MAX_PULSE_MS, OwnerChange, PulseEnd, Refusal, to_packet,
+};
 use crate::state::DaemonState;
 use crate::waiters::{Subscribers, WaiterKind, WaiterPredicate, WaiterRegistry};
 
@@ -22,6 +23,7 @@ pub struct Daemon {
     pub state: Mutex<DaemonState>,
     pub waiters: Mutex<WaiterRegistry>,
     pub subscribers: Mutex<Subscribers>,
+    pub gamepads: Mutex<Arbiter>,
     /// How long a request waits for the RC's answer.
     pub timeout: Duration,
 }
@@ -33,6 +35,7 @@ impl Daemon {
             state: Mutex::new(DaemonState::new()),
             waiters: Mutex::new(WaiterRegistry::new()),
             subscribers: Mutex::new(Subscribers::new()),
+            gamepads: Mutex::new(Arbiter::default()),
             timeout,
         }
     }
@@ -47,6 +50,23 @@ impl Daemon {
 
     fn waiters(&self) -> MutexGuard<'_, WaiterRegistry> {
         self.waiters.lock().expect("waiters mutex poisoned")
+    }
+
+    fn gamepads(&self) -> MutexGuard<'_, Arbiter> {
+        self.gamepads.lock().expect("gamepads mutex poisoned")
+    }
+
+    /// Sends one gamepad packet. Called with the arbiter lock held, which is
+    /// always taken before the client lock.
+    fn send_gamepad(&self, packet: &robocol::packets::Gamepad) {
+        self.client().send_gamepad(packet.clone());
+    }
+
+    fn announce(&self, changes: &[OwnerChange]) {
+        let mut subscribers = self.subscribers.lock().expect("subscribers mutex poisoned");
+        for change in changes {
+            subscribers.broadcast(&change.to_json());
+        }
     }
 }
 
@@ -79,6 +99,8 @@ fn needs_rc(request: &Request) -> bool {
         Request::Hello { .. }
             | Request::Ping
             | Request::Status
+            | Request::Claim { .. }
+            | Request::Release { .. }
             | Request::Connect
             | Request::Disconnect
             | Request::Watch
@@ -166,7 +188,11 @@ pub fn handle_request(request: Request, session: &mut Session, daemon: &Daemon) 
             json!({"ok": true, "role": role})
         }
         Request::Ping => json!({"ok": true}),
-        Request::Status => daemon.state().to_json(),
+        Request::Status => {
+            let mut status = daemon.state().to_json();
+            status["gamepads"] = daemon.gamepads().to_json();
+            status
+        }
         Request::List => match wait_for_event(daemon, WaiterKind::OpModeList, any_event(), |c| {
             c.request_opmode_list()
         }) {
@@ -316,13 +342,66 @@ pub fn handle_request(request: Request, session: &mut Session, daemon: &Daemon) 
             daemon.client().disconnect();
             json!({"ok": true})
         }
-        Request::Gamepad(input) => {
-            daemon.client().send_gamepad(to_packet(&input));
-            if let Some(ms) = input.duration_ms {
-                std::thread::sleep(Duration::from_millis(ms));
-                daemon.client().send_gamepad(Gamepad::default());
+        Request::Claim { pads } => {
+            if pads.is_empty() {
+                return err("bad_args", "claim needs gamepad1, gamepad2 or both");
             }
-            json!({"ok": true})
+            match gamepad::claim(&daemon.gamepads, session.role, &pads, |g| {
+                daemon.send_gamepad(g)
+            }) {
+                Ok(changes) => {
+                    daemon.announce(&changes);
+                    json!({"ok": true, "held": daemon.gamepads().held_by(session.role)})
+                }
+                Err(refusal) => refusal.to_json(),
+            }
+        }
+        Request::Release { pads } => {
+            let pads = pads.unwrap_or_else(|| Pad::ALL.to_vec());
+            let changes = gamepad::release(&daemon.gamepads, session.role, &pads, |g| {
+                daemon.send_gamepad(g)
+            });
+            daemon.announce(&changes);
+            let released: Vec<Pad> = changes.iter().map(|c| c.pad).collect();
+            json!({"ok": true, "released": released})
+        }
+        Request::Gamepad(input) => {
+            let user = input.user.unwrap_or(1);
+            let Some(pad) = Pad::from_user(user) else {
+                return err("bad_args", format!("user must be 1 or 2, got {user}"));
+            };
+            let duration_ms = input.duration_ms.unwrap_or(DEFAULT_PULSE_MS);
+            if duration_ms > MAX_PULSE_MS {
+                return err(
+                    "bad_args",
+                    format!("a pulse can last at most {MAX_PULSE_MS} ms, not {duration_ms}"),
+                );
+            }
+            let packet = to_packet(&input, pad);
+            match gamepad::pulse(
+                &daemon.gamepads,
+                session.role,
+                pad,
+                &packet,
+                duration_ms,
+                |g| daemon.send_gamepad(g),
+            ) {
+                Err(refusal) => refusal.to_json(),
+                Ok(PulseEnd::Completed { packets }) => {
+                    json!({"ok": true, "user": user, "packets": packets})
+                }
+                Ok(PulseEnd::Superseded { packets }) => {
+                    json!({"ok": true, "user": user, "packets": packets, "superseded": true})
+                }
+                Ok(PulseEnd::Lost {
+                    owner: Some(Role::Operator),
+                    ..
+                }) if session.role == Role::Agent => Refusal::Preempted(pad).to_json(),
+                Ok(PulseEnd::Lost { .. }) => err(
+                    "not_claimed",
+                    format!("{} was released while the pulse ran", pad.name()),
+                ),
+            }
         }
         // The connection layer handles these: `watch` takes over the stream
         // and `shutdown` exits the process, so neither reaches dispatch.
@@ -536,6 +615,143 @@ mod tests {
         let reply = handle_request(Request::Run { name: None }, &mut session, &daemon);
         assert_eq!(reply["ok"], true);
         assert_eq!(reply["name"], "Foo");
+    }
+
+    fn operator() -> Session {
+        Session {
+            role: Role::Operator,
+            last_inited: None,
+        }
+    }
+
+    fn status_gamepads(daemon: &Daemon) -> Value {
+        handle_request(Request::Status, &mut Session::new(), daemon)["gamepads"].clone()
+    }
+
+    #[test]
+    fn claim_needs_no_rc_and_announces_the_new_owner() {
+        let daemon = test_daemon(Duration::from_millis(50));
+        let events = daemon.subscribers.lock().unwrap().subscribe();
+        let reply = handle_request(
+            Request::Claim {
+                pads: vec![Pad::Gamepad1],
+            },
+            &mut Session::new(),
+            &daemon,
+        );
+        assert_eq!(reply, json!({"ok": true, "held": ["gamepad1"]}));
+        assert_eq!(
+            events.try_recv().unwrap(),
+            json!({"event": "gamepad_owner", "user": 1, "owner": "agent", "previous": null})
+        );
+        assert_eq!(
+            status_gamepads(&daemon),
+            json!({"gamepad1": "agent", "gamepad2": null})
+        );
+    }
+
+    #[test]
+    fn an_agent_cannot_claim_what_the_operator_holds() {
+        let daemon = test_daemon(Duration::from_millis(50));
+        let claim = |pads: Vec<Pad>, session: &mut Session| {
+            handle_request(Request::Claim { pads }, session, &daemon)
+        };
+        assert_eq!(claim(vec![Pad::Gamepad2], &mut operator())["ok"], true);
+        let reply = claim(Pad::ALL.to_vec(), &mut Session::new());
+        assert_eq!(reply["error"], "preempted");
+        assert_eq!(
+            status_gamepads(&daemon),
+            json!({"gamepad1": null, "gamepad2": "operator"})
+        );
+    }
+
+    #[test]
+    fn release_defaults_to_every_pad_you_hold() {
+        let daemon = test_daemon(Duration::from_millis(50));
+        let mut agent = Session::new();
+        let claim = Request::Claim {
+            pads: Pad::ALL.to_vec(),
+        };
+        handle_request(claim, &mut agent, &daemon);
+        let reply = handle_request(Request::Release { pads: None }, &mut agent, &daemon);
+        assert_eq!(
+            reply,
+            json!({"ok": true, "released": ["gamepad1", "gamepad2"]})
+        );
+        assert_eq!(
+            status_gamepads(&daemon),
+            json!({"gamepad1": null, "gamepad2": null})
+        );
+    }
+
+    #[test]
+    fn an_empty_claim_is_bad_args() {
+        let daemon = test_daemon(Duration::from_millis(50));
+        let reply = handle_request(
+            Request::Claim { pads: vec![] },
+            &mut Session::new(),
+            &daemon,
+        );
+        assert_eq!(reply["error"], "bad_args");
+    }
+
+    #[test]
+    fn gamepad_needs_a_claim() {
+        let daemon = test_daemon(Duration::from_millis(50));
+        connected(&daemon);
+        let reply = handle_request(
+            Request::Gamepad(ds_proto::GamepadInput::default()),
+            &mut Session::new(),
+            &daemon,
+        );
+        assert_eq!(reply["error"], "not_claimed");
+    }
+
+    #[test]
+    fn gamepad_checks_its_user_and_duration() {
+        let daemon = test_daemon(Duration::from_millis(50));
+        connected(&daemon);
+        let mut agent = Session::new();
+        let claim = Request::Claim {
+            pads: Pad::ALL.to_vec(),
+        };
+        handle_request(claim, &mut agent, &daemon);
+        let input = |user, duration_ms| {
+            Request::Gamepad(ds_proto::GamepadInput {
+                user: Some(user),
+                duration_ms: Some(duration_ms),
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            handle_request(input(3, 20), &mut agent, &daemon)["error"],
+            "bad_args"
+        );
+        assert_eq!(
+            handle_request(input(1, MAX_PULSE_MS + 1), &mut agent, &daemon)["error"],
+            "bad_args"
+        );
+    }
+
+    #[test]
+    fn gamepad_pulses_a_claimed_pad() {
+        let daemon = test_daemon(Duration::from_millis(50));
+        connected(&daemon);
+        let mut agent = Session::new();
+        let claim = Request::Claim {
+            pads: vec![Pad::Gamepad2],
+        };
+        handle_request(claim, &mut agent, &daemon);
+        let request = Request::Gamepad(ds_proto::GamepadInput {
+            user: Some(2),
+            left_stick_y: Some(-0.5),
+            duration_ms: Some(40),
+            ..Default::default()
+        });
+        assert_eq!(
+            handle_request(request, &mut agent, &daemon),
+            json!({"ok": true, "user": 2, "packets": 2})
+        );
     }
 
     #[test]
