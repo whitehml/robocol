@@ -13,6 +13,9 @@ use robocol::types::RobotState;
 pub struct DaemonState {
     pub connected: bool,
     pub peer: Option<String>,
+    /// The RC that answered discovery as already owned by another driver
+    /// station. Discovery stays paused until a `connect` request.
+    pub peer_busy: Option<String>,
     pub robot_state: Option<RobotState>,
     pub opmodes: Vec<OpModeMeta>,
     pub active_config: Option<String>,
@@ -33,6 +36,7 @@ impl DaemonState {
         DaemonState {
             connected: false,
             peer: None,
+            peer_busy: None,
             robot_state: None,
             opmodes: Vec::new(),
             active_config: None,
@@ -49,6 +53,12 @@ impl DaemonState {
             Event::Connected { peer } => {
                 self.connected = true;
                 self.peer = Some(peer.to_string());
+                self.peer_busy = None;
+            }
+            Event::PeerBusy { peer } => {
+                self.connected = false;
+                self.peer = None;
+                self.peer_busy = Some(peer.to_string());
             }
             Event::Disconnected => {
                 self.connected = false;
@@ -107,6 +117,7 @@ impl DaemonState {
             "ok": true,
             "connected": self.connected,
             "peer": self.peer,
+            "peer_busy": self.peer_busy,
             "robot_state": self.robot_state.map(|s| format!("{s:?}")),
             "opmodes": opmodes,
             "active_config": self.active_config,
@@ -146,6 +157,20 @@ mod tests {
         assert!(!state.connected);
         assert_eq!(state.robot_state, None);
         assert_eq!(state.peer, None);
+    }
+
+    #[test]
+    fn a_busy_rc_is_remembered_until_a_connection() {
+        let mut state = DaemonState::new();
+        let peer: SocketAddr = "192.168.43.1:20884".parse().unwrap();
+        state.apply_event(&Event::PeerBusy { peer });
+        assert!(!state.connected);
+        assert_eq!(state.peer_busy.as_deref(), Some("192.168.43.1:20884"));
+        assert_eq!(state.to_json()["peer_busy"], "192.168.43.1:20884");
+
+        state.apply_event(&Event::Connected { peer });
+        assert!(state.connected);
+        assert_eq!(state.peer_busy, None);
     }
 
     #[test]

@@ -11,6 +11,7 @@ pub fn watch_json(event: &Event) -> Option<Value> {
     Some(match event {
         Event::Connected { peer } => json!({"event": "connected", "peer": peer.to_string()}),
         Event::Disconnected => json!({"event": "disconnected"}),
+        Event::PeerBusy { peer } => json!({"event": "peer_busy", "peer": peer.to_string()}),
         Event::RobotState(s) => json!({"event": "state", "state": format!("{s:?}")}),
         Event::Telemetry(t) => {
             let strings: Map<String, Value> = t
@@ -57,6 +58,15 @@ mod tests {
                 "strings": {"Alliance": "RED"},
                 "numbers": {"heading_deg": 12.5},
             })
+        );
+    }
+
+    #[test]
+    fn a_busy_rc_is_a_watch_event() {
+        let peer = "192.168.43.1:20884".parse().unwrap();
+        assert_eq!(
+            watch_json(&Event::PeerBusy { peer }),
+            Some(json!({"event": "peer_busy", "peer": "192.168.43.1:20884"}))
         );
     }
 

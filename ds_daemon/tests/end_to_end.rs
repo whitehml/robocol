@@ -91,56 +91,82 @@ fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
     }
 }
 
-#[test]
-fn drives_an_opmode_and_watches_telemetry_against_fake_rc() {
-    build_bins(&["ds_agent", "fake_rc"]);
-
-    let tmp = tempdir("");
-    let fake_rc_port: u16 = 20950;
-
-    let mut fake_rc = ChildGuard(
+/// Starts `fake_rc` on `port`, with extra environment such as `FAKE_RC_BUSY`.
+fn start_fake_rc(port: u16, env: &[(&str, &str)]) -> ChildGuard {
+    ChildGuard(
         Command::new(bin_path("fake_rc"))
-            .arg(fake_rc_port.to_string())
+            .arg(port.to_string())
+            .envs(env.iter().copied())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("start fake_rc"),
-    );
+    )
+}
 
-    let mut daemon = ChildGuard(
+/// Starts a daemon pointed at a `fake_rc` on `rc_port`, serving `socket_dir`,
+/// and waits for its socket. Binds UDP port 0, never the default 20884,
+/// which a running Deck Station may hold.
+fn start_daemon(socket_dir: &Path, rc_port: u16) -> ChildGuard {
+    let daemon = ChildGuard(
         Command::new(bin_path("ds_daemon"))
             .args([
                 "--peer",
                 "127.0.0.1",
                 "--peer-port",
-                &fake_rc_port.to_string(),
+                &rc_port.to_string(),
                 "--bind-port",
                 "0",
             ])
-            .env("XDG_RUNTIME_DIR", &tmp)
+            .env("XDG_RUNTIME_DIR", socket_dir)
             .env("DS_DAEMON_TIMEOUT_MS", "2000")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("start ds_daemon"),
     );
-
-    // Wait for the daemon's socket to exist before sending anything.
-    let socket_path = tmp.join("ds_daemon.sock");
+    let socket = socket_dir.join("ds_daemon.sock");
     assert!(
-        wait_until(Duration::from_secs(3), || socket_path.exists()),
+        wait_until(Duration::from_secs(3), || socket.exists()),
         "ds_daemon socket never appeared"
     );
+    daemon
+}
 
-    // Wait for the daemon to actually connect to fake_rc (discovery + a
-    // couple of heartbeats) before issuing commands that depend on it.
+/// Waits for the daemon to finish discovery with its RC.
+fn wait_connected(socket_dir: &Path) {
     assert!(
-        wait_until(
-            Duration::from_secs(3),
-            || run_agent(&tmp, &["status"])["connected"] == true
-        ),
+        wait_until(Duration::from_secs(3), || run_agent(
+            socket_dir,
+            &["status"]
+        )["connected"]
+            == true),
         "ds_daemon never connected to fake_rc"
     );
+}
+
+/// `shutdown`, and proof that the daemon process actually exits on it.
+fn shut_down(socket_dir: &Path, daemon: &mut ChildGuard) {
+    let stopped = run_agent(socket_dir, &["shutdown"]);
+    assert_eq!(stopped["ok"], true, "shutdown reply: {stopped}");
+    assert!(
+        wait_until(Duration::from_secs(2), || matches!(
+            daemon.0.try_wait(),
+            Ok(Some(_))
+        )),
+        "daemon did not exit after `shutdown`"
+    );
+}
+
+#[test]
+fn drives_an_opmode_and_watches_telemetry_against_fake_rc() {
+    build_bins(&["ds_agent", "fake_rc"]);
+
+    let tmp = tempdir("");
+    let fake_rc_port: u16 = 20950;
+    let mut fake_rc = start_fake_rc(fake_rc_port, &[]);
+    let mut daemon = start_daemon(&tmp, fake_rc_port);
+    wait_connected(&tmp);
 
     let list = run_agent(&tmp, &["list"]);
     assert_eq!(list["ok"], true);
@@ -203,17 +229,8 @@ fn drives_an_opmode_and_watches_telemetry_against_fake_rc() {
     }
 
     // Explicit teardown via `shutdown`, ahead of ChildGuard's Drop kill,
-    // proves the shutdown command itself works — and that the daemon
-    // actually exits on it, not just acknowledges.
-    let stopped = run_agent(&tmp, &["shutdown"]);
-    assert_eq!(stopped["ok"], true);
-    assert!(
-        wait_until(Duration::from_secs(2), || matches!(
-            daemon.0.try_wait(),
-            Ok(Some(_))
-        )),
-        "daemon did not exit after `shutdown`"
-    );
+    // proves the shutdown command itself works.
+    shut_down(&tmp, &mut daemon);
     let _ = fake_rc.0.kill();
 
     std::fs::remove_dir_all(&tmp).expect("clean up runtime dir");
@@ -316,5 +333,42 @@ fn a_daemon_that_dies_on_startup_is_explained() {
         "a daemon that failed to start left its socket behind"
     );
 
+    std::fs::remove_dir_all(&tmp).expect("clean up runtime dir");
+}
+
+#[test]
+fn a_busy_rc_is_reported_until_connect() {
+    build_bins(&["ds_agent", "fake_rc"]);
+
+    let tmp = tempdir("busy_");
+    let fake_rc_port: u16 = 20951;
+    // fake_rc acts owned by another driver station for its first 2 s.
+    let mut fake_rc = start_fake_rc(fake_rc_port, &[("FAKE_RC_BUSY", "2")]);
+    let busy_until = Instant::now() + Duration::from_secs(2);
+    let mut daemon = start_daemon(&tmp, fake_rc_port);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || {
+            !run_agent(&tmp, &["status"])["peer_busy"].is_null()
+        }),
+        "the daemon never reported the busy RC"
+    );
+    let list = run_agent(&tmp, &["list"]);
+    assert_eq!(list["error"], "peer_busy", "list: {list}");
+
+    // Discovery stays paused after the other driver station goes away: the
+    // daemon waits to be told before trying again.
+    std::thread::sleep(
+        busy_until.saturating_duration_since(Instant::now()) + Duration::from_millis(500),
+    );
+    assert_eq!(run_agent(&tmp, &["status"])["connected"], false);
+
+    let connect = run_agent(&tmp, &["connect"]);
+    assert_eq!(connect["ok"], true, "connect: {connect}");
+    wait_connected(&tmp);
+    assert!(run_agent(&tmp, &["status"])["peer_busy"].is_null());
+
+    shut_down(&tmp, &mut daemon);
+    let _ = fake_rc.0.kill();
     std::fs::remove_dir_all(&tmp).expect("clean up runtime dir");
 }

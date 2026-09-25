@@ -79,20 +79,29 @@ fn needs_rc(request: &Request) -> bool {
         Request::Hello { .. }
             | Request::Ping
             | Request::Status
+            | Request::Connect
+            | Request::Disconnect
             | Request::Watch
             | Request::Shutdown
     )
 }
 
-/// Fails fast with `not_connected` before any request that needs the RC,
-/// rather than waiting out a timeout or silently dropping a packet that has
-/// no peer to go to.
+/// Fails fast before any request that needs the RC, rather than waiting out
+/// a timeout or silently dropping a packet that has no peer to go to:
+/// `peer_busy` when the RC is owned by another driver station, else
+/// `not_connected`.
 fn ensure_connected(daemon: &Daemon) -> Result<(), Value> {
-    if daemon.state().connected {
-        Ok(())
-    } else {
-        Err(err("not_connected", "robot controller not connected yet"))
+    let state = daemon.state();
+    if state.connected {
+        return Ok(());
     }
+    Err(match &state.peer_busy {
+        Some(peer) => err(
+            "peer_busy",
+            format!("{peer} is connected to another driver station; close it, then run `connect`"),
+        ),
+        None => err("not_connected", "robot controller not connected yet"),
+    })
 }
 
 /// Predicate for requests whose answer carries nothing to match on.
@@ -298,6 +307,15 @@ pub fn handle_request(request: Request, session: &mut Session, daemon: &Daemon) 
                 Err(e) => e,
             }
         }
+        Request::Connect => {
+            daemon.state().peer_busy = None;
+            daemon.client().connect();
+            json!({"ok": true})
+        }
+        Request::Disconnect => {
+            daemon.client().disconnect();
+            json!({"ok": true})
+        }
         Request::Gamepad(input) => {
             daemon.client().send_gamepad(to_packet(&input));
             if let Some(ms) = input.duration_ms {
@@ -389,6 +407,31 @@ mod tests {
         );
         assert_eq!(reply, json!({"ok": true, "role": "operator"}));
         assert_eq!(session.role, Role::Operator);
+    }
+
+    #[test]
+    fn a_busy_rc_fails_requests_with_peer_busy_until_connect() {
+        let daemon = test_daemon(Duration::from_millis(50));
+        let peer = "192.168.43.1:20884".parse().unwrap();
+        daemon.state().apply_event(&Event::PeerBusy { peer });
+
+        let reply = handle_request(Request::List, &mut Session::new(), &daemon);
+        assert_eq!(reply["error"], "peer_busy");
+        let message = reply["message"].as_str().unwrap();
+        assert!(message.contains("192.168.43.1:20884") && message.contains("connect"));
+
+        let reply = handle_request(Request::Connect, &mut Session::new(), &daemon);
+        assert_eq!(reply, json!({"ok": true}));
+        assert_eq!(daemon.state().peer_busy, None);
+        let reply = handle_request(Request::List, &mut Session::new(), &daemon);
+        assert_eq!(reply["error"], "not_connected");
+    }
+
+    #[test]
+    fn disconnect_needs_no_rc() {
+        let daemon = test_daemon(Duration::from_millis(50));
+        let reply = handle_request(Request::Disconnect, &mut Session::new(), &daemon);
+        assert_eq!(reply, json!({"ok": true}));
     }
 
     #[test]

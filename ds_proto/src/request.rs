@@ -143,6 +143,8 @@ pub enum Request {
         serial: String,
     },
     Gamepad(GamepadInput),
+    Connect,
+    Disconnect,
     Watch,
     Shutdown,
 }
@@ -171,6 +173,8 @@ impl Request {
             Request::Scan => "scan",
             Request::LynxModules { .. } => "lynx-modules",
             Request::Gamepad(_) => "gamepad",
+            Request::Connect => "connect",
+            Request::Disconnect => "disconnect",
             Request::Watch => "watch",
             Request::Shutdown => "shutdown",
         }
@@ -361,6 +365,20 @@ pub const PARSE_TABLE: &[Verb] = &[
             "--duration",
             "300ms",
         ],
+        text_arg: false,
+    },
+    Verb {
+        name: "connect",
+        usage: "connect",
+        parse: |a| no_args("connect", a, Request::Connect),
+        example: &[],
+        text_arg: false,
+    },
+    Verb {
+        name: "disconnect",
+        usage: "disconnect",
+        parse: |a| no_args("disconnect", a, Request::Disconnect),
+        example: &[],
         text_arg: false,
     },
     Verb {

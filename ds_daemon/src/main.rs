@@ -14,7 +14,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::time::Duration;
 
-use robocol::{ClientConfig, RobocolClient};
+use robocol::{ClientConfig, Event, RobocolClient};
 
 use connection::handle_connection;
 use dispatch::Daemon;
@@ -121,6 +121,11 @@ fn main() {
         let daemon = daemon.clone();
         std::thread::spawn(move || {
             for event in events {
+                if let Event::PeerBusy { peer } = &event {
+                    eprintln!(
+                        "ds_daemon: {peer} is connected to another driver station; paused until `connect`"
+                    );
+                }
                 daemon
                     .state
                     .lock()
