@@ -2,6 +2,10 @@
 //! Every process must resolve the same path and speak the same framing, so
 //! this logic lives once instead of being duplicated on each side of the pipe.
 
+pub mod filter;
+
+pub use filter::WatchFilter;
+
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 

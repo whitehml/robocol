@@ -91,10 +91,7 @@ pub enum Request {
         #[serde(default)]
         duration_ms: Option<u64>,
     },
-    Watch {
-        #[serde(default)]
-        types: Option<Vec<String>>,
-    },
+    Watch,
     Shutdown,
 }
 
@@ -572,7 +569,7 @@ pub fn handle_request(
         // Watch and Shutdown are handled by the connection layer, which
         // needs the raw stream to push a live stream / exit the process;
         // they never reach this dispatcher.
-        Request::Watch { .. } | Request::Shutdown => {
+        Request::Watch | Request::Shutdown => {
             unreachable!("Watch and Shutdown are intercepted before handle_request is called")
         }
     }

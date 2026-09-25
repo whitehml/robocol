@@ -1,12 +1,13 @@
-//! Two independent fan-out mechanisms sitting on top of the same
-//! `robocol::Event` stream: `WaiterRegistry` resolves exactly one
-//! request/response call per registration and then forgets it;
-//! `Subscribers` keeps broadcasting to every `watch` connection until it
-//! disconnects.
+//! Two independent fan-out mechanisms fed by the event pump:
+//! `WaiterRegistry` resolves exactly one request/response call per
+//! registration from the `robocol::Event` stream and then forgets it;
+//! `Subscribers` keeps sending watch lines (already JSON) to every `watch`
+//! connection until it disconnects.
 
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 
 use robocol::client::Event;
+use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaiterKind {
@@ -120,7 +121,7 @@ impl WaiterRegistry {
 const SUBSCRIBER_QUEUE: usize = 64;
 
 pub struct Subscribers {
-    list: Vec<SyncSender<Event>>,
+    list: Vec<SyncSender<Value>>,
 }
 
 impl Subscribers {
@@ -128,16 +129,16 @@ impl Subscribers {
         Subscribers { list: Vec::new() }
     }
 
-    pub fn subscribe(&mut self) -> Receiver<Event> {
+    pub fn subscribe(&mut self) -> Receiver<Value> {
         let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_QUEUE);
         self.list.push(tx);
         rx
     }
 
-    /// Sends `event` to every live subscriber, dropping any whose receiver
+    /// Sends one watch line to every live subscriber, dropping any whose receiver
     /// has gone away (their `watch` connection closed). A subscriber whose
     /// queue is full just misses this event; it is not pruned.
-    pub fn broadcast(&mut self, event: &Event) {
+    pub fn broadcast(&mut self, event: &Value) {
         self.list.retain(|tx| match tx.try_send(event.clone()) {
             Ok(()) | Err(TrySendError::Full(_)) => true,
             Err(TrySendError::Disconnected(_)) => false,
@@ -151,6 +152,10 @@ mod tests {
 
     fn any() -> WaiterPredicate {
         Box::new(|_| true)
+    }
+
+    fn line() -> Value {
+        serde_json::json!({"event": "disconnected"})
     }
 
     #[test]
@@ -242,9 +247,9 @@ mod tests {
         let mut subs = Subscribers::new();
         let a = subs.subscribe();
         let b = subs.subscribe();
-        subs.broadcast(&Event::Disconnected);
-        assert_eq!(a.try_recv().unwrap(), Event::Disconnected);
-        assert_eq!(b.try_recv().unwrap(), Event::Disconnected);
+        subs.broadcast(&line());
+        assert_eq!(a.try_recv().unwrap(), line());
+        assert_eq!(b.try_recv().unwrap(), line());
     }
 
     #[test]
@@ -254,8 +259,8 @@ mod tests {
             let _rx = subs.subscribe(); // dropped immediately
         }
         let live = subs.subscribe();
-        subs.broadcast(&Event::Disconnected);
-        assert_eq!(live.try_recv().unwrap(), Event::Disconnected);
+        subs.broadcast(&line());
+        assert_eq!(live.try_recv().unwrap(), line());
         assert_eq!(subs.list.len(), 1);
     }
 
@@ -271,7 +276,7 @@ mod tests {
         // Overfill the slow subscriber's queue; broadcast must neither block
         // nor prune it.
         for _ in 0..(SUBSCRIBER_QUEUE + 10) {
-            subs.broadcast(&Event::Disconnected);
+            subs.broadcast(&line());
         }
         assert_eq!(
             subs.list.len(),
@@ -287,7 +292,7 @@ mod tests {
         assert_eq!(received, SUBSCRIBER_QUEUE);
 
         // Once drained, the subscriber receives again.
-        subs.broadcast(&Event::Disconnected);
-        assert_eq!(slow.try_recv().unwrap(), Event::Disconnected);
+        subs.broadcast(&line());
+        assert_eq!(slow.try_recv().unwrap(), line());
     }
 }

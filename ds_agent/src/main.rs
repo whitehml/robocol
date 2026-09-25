@@ -6,7 +6,7 @@
 //! ds_agent init "Duo (TeleOp)"
 //! ds_agent run
 //! ds_agent gamepad --left-stick-y -0.5 --duration 300ms
-//! ds_agent watch --types telemetry
+//! ds_agent watch --types telemetry --tag TELEMETRY_DATA --key heading_deg
 //! ds_agent daemon status
 //! DS_DAEMON_ARGS="--peer 192.168.43.1 --bind-port 0" ds_agent status   # extra ds_daemon flags on auto-spawn
 //! ```
@@ -146,22 +146,12 @@ fn build_gamepad_request(args: &[String]) -> Result<serde_json::Value, String> {
     Ok(serde_json::Value::Object(map))
 }
 
+/// The daemon streams every event; the flags only narrow what this process
+/// prints, so they are validated here and never sent.
 fn build_watch_request(args: &[String]) -> Result<serde_json::Value, String> {
-    let mut types: Option<Vec<String>> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--types" => {
-                let list = args
-                    .get(i + 1)
-                    .ok_or("usage: ds_agent watch [--types a,b,c]")?;
-                types = Some(list.split(',').map(str::to_string).collect());
-                i += 2;
-            }
-            other => return Err(format!("unknown watch flag: {other}")),
-        }
-    }
-    Ok(serde_json::json!({"cmd": "watch", "types": types}))
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    ds_proto::WatchFilter::parse(&refs)?;
+    Ok(serde_json::json!({"cmd": "watch"}))
 }
 
 /// Connects to the daemon, spawning it detached (its own process group) if
@@ -303,8 +293,15 @@ fn main() {
 
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
     if is_watch {
+        let flags: Vec<&str> = raw_args[1..].iter().map(String::as_str).collect();
+        let filter = ds_proto::WatchFilter::parse(&flags).expect("validated by build_request");
         while let Ok(Some(line)) = ds_proto::read_message(&mut reader) {
-            println!("{line}");
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if let Some(shown) = filter.apply(&event) {
+                println!("{shown}");
+            }
         }
         return;
     }
@@ -394,21 +391,18 @@ mod tests {
     }
 
     #[test]
-    fn watch_parses_comma_separated_types() {
-        let args: Vec<String> = ["watch", "--types", "telemetry,disconnected"]
+    fn watch_validates_its_flags_but_sends_none() {
+        let args: Vec<String> = ["watch", "--types", "telemetry", "--key", "heading_deg"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         let req = build_request(&args).unwrap();
-        assert_eq!(
-            req["types"],
-            serde_json::json!(["telemetry", "disconnected"])
-        );
-    }
+        assert_eq!(req, serde_json::json!({"cmd": "watch"}));
 
-    #[test]
-    fn watch_with_no_flags_sends_null_types() {
-        let req = build_request(&["watch".to_string()]).unwrap();
-        assert_eq!(req["types"], serde_json::Value::Null);
+        let bad: Vec<String> = ["watch", "--types", "nope"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(build_request(&bad).is_err());
     }
 }

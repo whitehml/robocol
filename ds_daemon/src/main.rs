@@ -6,6 +6,7 @@ mod connection;
 mod request;
 mod state;
 mod waiters;
+mod watch;
 
 use std::net::IpAddr;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -133,10 +134,12 @@ fn main() {
                     .lock()
                     .expect("waiters mutex poisoned")
                     .resolve(&event);
-                subscribers
-                    .lock()
-                    .expect("subscribers mutex poisoned")
-                    .broadcast(&event);
+                if let Some(line) = watch::watch_json(&event) {
+                    subscribers
+                        .lock()
+                        .expect("subscribers mutex poisoned")
+                        .broadcast(&line);
+                }
             }
             // The robocol worker only drops its sender when it dies. A
             // daemon with no robot connection must not linger answering
