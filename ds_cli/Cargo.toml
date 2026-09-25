@@ -3,13 +3,14 @@ name = "ds_cli"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Interactive Robocol client for a real FTC Control Hub"
+description = "Interactive front end for ds_daemon, for a person at a terminal"
 
 [[bin]]
 name = "ds_cli"
 path = "src/main.rs"
 
 [dependencies]
-robocol = { path = "../robocol" }
+ds_proto = { path = "../ds_proto" }
+serde_json = "1"
 # Only the CLI needs a line editor.
 rustyline = { version = "18.0.1", default-features = false }

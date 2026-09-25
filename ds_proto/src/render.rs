@@ -41,7 +41,12 @@ fn render_event(kind: &str, e: &Value) -> String {
             for section in ["strings", "numbers"] {
                 if let Some(map) = e[section].as_object() {
                     for (key, value) in map {
-                        line.push_str(&format!(" {key}={}", text(value)));
+                        // `telemetry.addLine()` text arrives with an empty key.
+                        if key.is_empty() {
+                            line.push_str(&format!(" {}", text(value)));
+                        } else {
+                            line.push_str(&format!(" {key}={}", text(value)));
+                        }
                     }
                 }
             }
@@ -134,6 +139,13 @@ mod tests {
             render(&event),
             "<< telemetry [T] Alliance=RED heading_deg=12.5"
         );
+    }
+
+    #[test]
+    fn telemetry_lines_without_a_key_show_as_text() {
+        let event = json!({"event": "telemetry", "tag": "T",
+            "strings": {"": "Hint : X toggles alliance"}, "numbers": {}});
+        assert_eq!(render(&event), "<< telemetry [T] Hint : X toggles alliance");
     }
 
     #[test]

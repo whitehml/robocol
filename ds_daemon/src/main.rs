@@ -107,7 +107,7 @@ fn main() {
         Ok(started) => started,
         Err(e) => {
             eprintln!(
-                "ds_daemon: cannot bind UDP port {bind_port}: {e} (is Deck Station or ds_cli already running?)"
+                "ds_daemon: cannot bind UDP port {bind_port}: {e} (is Deck Station or another ds_daemon already running?)"
             );
             // Don't leave a socket file that ds_agent would mistake for a
             // live daemon.

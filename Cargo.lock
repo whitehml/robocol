@@ -41,8 +41,9 @@ dependencies = [
 name = "ds_cli"
 version = "0.1.0"
 dependencies = [
- "robocol",
+ "ds_proto",
  "rustyline",
+ "serde_json",
 ]
 
 [[package]]

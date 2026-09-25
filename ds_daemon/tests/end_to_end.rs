@@ -619,3 +619,81 @@ fn gamepad_ownership_and_pulses_against_fake_rc() {
     shut_down(&tmp, &mut daemon);
     let _ = fake_rc.0.kill();
 }
+
+#[test]
+fn ds_cli_is_an_operator_on_the_same_daemon() {
+    build_bins(&["ds_agent", "ds_cli"]);
+
+    let tmp = tempdir("cli_");
+    // Port 1: nothing answers, so no fake_rc is needed.
+    let env: Vec<(&str, &str)> = vec![(
+        "DS_DAEMON_ARGS",
+        "--peer 127.0.0.1 --peer-port 1 --bind-port 0",
+    )];
+    let _daemon = SpawnedDaemonGuard {
+        dir: tmp.to_path_buf(),
+        env: env.clone(),
+    };
+
+    // Piped input: ds_cli reads lines without a terminal.
+    let mut cli = Command::new(bin_path("ds_cli"))
+        .arg("--json")
+        .env("XDG_RUNTIME_DIR", &tmp)
+        .envs(env.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start ds_cli");
+    {
+        let mut stdin = cli.stdin.take().expect("ds_cli stdin");
+        for line in [
+            "status",
+            "claim gamepad1",
+            "init",
+            "watch --types nope",
+            "quit",
+        ] {
+            writeln!(stdin, "{line}").expect("type into ds_cli");
+        }
+    }
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(cli.wait_with_output());
+    });
+    let output = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("ds_cli did not quit")
+        .expect("wait for ds_cli");
+    assert!(
+        output.status.success(),
+        "ds_cli exited with {}",
+        output.status
+    );
+
+    let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert!(
+        lines
+            .iter()
+            .any(|v| v["ok"] == true && v["connected"] == false),
+        "no status reply in {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|v| v["held"] == serde_json::json!(["gamepad1"])),
+        "no claim reply in {lines:?}"
+    );
+    assert_eq!(
+        lines.iter().filter(|v| v["error"] == "bad_args").count(),
+        2,
+        "`init` without a name and a bad watch filter: {lines:?}"
+    );
+
+    // The operator's claim lives in the daemon, visible from the agent side.
+    let status = run_agent_with_env(&tmp, &["status"], &env);
+    assert_eq!(status["gamepads"]["gamepad1"], "operator", "{status}");
+}

@@ -1,175 +1,229 @@
-//! Interactive test client for a real Control Hub.
+//! Interactive front end for `ds_daemon`, for a person at a terminal. Takes
+//! the same verbs as `ds_agent` (both parse with `ds_proto`), shows replies
+//! as text instead of JSON, and prints the daemon's live events as they
+//! arrive.
 //!
-//! Join the Control Hub's WiFi AP, then:
 //! ```sh
-//! cargo run -p ds_cli            # tries 192.168.43.1 / 192.168.49.1
-//! cargo run -p ds_cli 10.0.0.5   # explicit RC address
+//! cargo run -p ds_cli                      # starts ds_daemon if none is running
+//! cargo run -p ds_cli -- --peer 10.0.0.5   # RC address, if this starts the daemon
+//! cargo run -p ds_cli -- --json            # raw JSON lines instead of text
 //! ```
-//! Commands: `list`, `init <name>`, `run`, `stop`, `restart`, `connect`, `disconnect`, `quit`,
-//! `active-config`, `configs`, `config <name>`, `save-config <json>`,
-//! `activate-config <name>`, `delete-config <name>`, `device-types`,
-//! `scan`, `lynx-modules <serial>`, `w` (pulse gamepad1 forward stick).
 //!
+//! At the prompt: any verb (`help` lists them), `watch [--types ..] [--tag
+//! ..] [--key ..]` to narrow the live events shown, and `quit`.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use robocol::client::{ClientConfig, Event, RobocolClient};
-use robocol::cmd::{self, ConfigMeta};
-use robocol::packets::Gamepad;
-use rustyline::DefaultEditor;
-use rustyline::ExternalPrinter;
+use ds_proto::{PARSE_TABLE, Request, Role, WatchFilter, parse, render, split_line, transport};
+use rustyline::{DefaultEditor, ExternalPrinter};
+use serde_json::{Value, json};
 
-const FORWARD_STICK: f32 = -0.5;
-const PULSE: Duration = Duration::from_millis(300);
+#[derive(Debug, PartialEq)]
+struct Args {
+    json: bool,
+    peer: Option<String>,
+}
 
-fn find_config(known: &Arc<Mutex<Vec<ConfigMeta>>>, name: &str) -> Option<ConfigMeta> {
-    known
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|c| c.name == name)
-        .cloned()
+fn parse_args(raw: &[String]) -> Result<Args, String> {
+    let mut args = Args {
+        json: false,
+        peer: None,
+    };
+    let mut rest = raw.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--json" => args.json = true,
+            "--peer" => {
+                let ip = rest.next().ok_or("--peer needs an IP address")?;
+                args.peer = Some(ip.clone());
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(args)
+}
+
+/// One reply or event, as JSON or as text.
+fn format_line(value: &Value, json: bool) -> String {
+    if json {
+        value.to_string()
+    } else {
+        render(value)
+    }
+}
+
+fn bad_args(message: impl Into<String>) -> Value {
+    json!({"ok": false, "error": "bad_args", "message": message.into()})
+}
+
+fn help() -> String {
+    let mut lines = vec!["commands (the same as ds_agent's):".to_string()];
+    lines.extend(PARSE_TABLE.iter().map(|verb| format!("  {}", verb.usage)));
+    lines.push("at this prompt only:".to_string());
+    lines.push(
+        "  watch [--types a,b] [--tag t,...] [--key k,...]   narrow the live events shown; no flags shows all"
+            .to_string(),
+    );
+    lines.push("  help".to_string());
+    lines.push("  quit".to_string());
+    lines.join("\n")
+}
+
+fn unreachable_exit(message: &str) -> ! {
+    eprintln!(
+        "{}",
+        json!({"ok": false, "error": "daemon_unreachable", "message": message})
+    );
+    std::process::exit(1);
 }
 
 fn main() {
-    let mut config = ClientConfig::default();
-    if let Some(addr) = std::env::args().nth(1) {
-        config.peer_addrs = vec![addr.parse().expect("invalid IP address")];
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let args = parse_args(&raw).unwrap_or_else(|e| {
+        eprintln!("{e}\nusage: ds_cli [--json] [--peer <ip>]");
+        std::process::exit(2);
+    });
+    let spawn_args: Vec<String> = match &args.peer {
+        Some(ip) => vec!["--peer".to_string(), ip.clone()],
+        None => Vec::new(),
+    };
+
+    // One connection for commands, one for the live event stream.
+    let mut session = transport::connect_or_spawn(Role::Operator, &spawn_args)
+        .unwrap_or_else(|e| unreachable_exit(&e));
+    let mut events =
+        transport::connect_or_spawn(Role::Operator, &[]).unwrap_or_else(|e| unreachable_exit(&e));
+    if let Err(e) = events.send(&Request::Watch) {
+        unreachable_exit(&e.to_string());
     }
 
-    let mut rl = DefaultEditor::new().expect("init line editor");
-    let mut printer = rl
-        .create_external_printer()
-        .expect("create external printer");
-    printer
-        .print(format!(
-            "robocol ds_cli — discovering RC at {:?}...\n",
-            config.peer_addrs
-        ))
-        .ok();
-
-    let (client, events) = RobocolClient::start(config).expect("bind UDP socket");
-
-    // Configs are identified by (location, resourceId), not by name alone,
-    // so `config <name>` / `activate-config <name>` / `delete-config <name>`
-    // look up the full ConfigMeta here rather than sending the bare name.
-    let known_configs: Arc<Mutex<Vec<ConfigMeta>>> = Arc::new(Mutex::new(Vec::new()));
-    let known_configs_bg = known_configs.clone();
-
-    std::thread::spawn(move || {
-        let mut last_telemetry = String::new();
-        for event in events {
-            let line = match event {
-                Event::Connected { peer } => format!("<< connected to {peer}"),
-                Event::Disconnected => "<< disconnected".to_string(),
-                Event::PeerBusy { peer } => {
-                    format!("!! {peer} is connected to another DS; `connect` to retry")
-                }
-                Event::RobotState(state) => format!("<< robot state: {state:?}"),
-                Event::OpModeList(list) => {
-                    let mut s = "<< opmodes:".to_string();
-                    for m in list {
-                        s.push_str(&format!("\n     {} [{} / {}]", m.name, m.flavor, m.group));
-                    }
-                    s
-                }
-                Event::OpModeInited(name) => format!("<< INIT: {name}"),
-                Event::OpModeRunning(name) => format!("<< RUNNING: {name}"),
-                Event::ActiveConfiguration(extra) => format!("<< active config: {extra}"),
-                Event::ConfigurationList(extra) => {
-                    *known_configs_bg.lock().unwrap() = cmd::parse_config_list(&extra);
-                    format!("<< configs: {extra}")
-                }
-                Event::Configuration(extra) => format!("<< config: {extra}"),
-                Event::UserDeviceList(extra) => format!("<< device types: {extra}"),
-                Event::ScanResult(extra) => format!("<< scan: {extra}"),
-                Event::LynxModules(extra) => format!("<< lynx modules: {extra}"),
-                Event::Telemetry(t) => {
-                    let strings: Vec<String> =
-                        t.strings.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                    let numbers: Vec<String> =
-                        t.numbers.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                    let line = format!(
-                        "<< telemetry [{}] {} {}",
-                        t.tag,
-                        strings.join(" "),
-                        numbers.join(" ")
-                    );
+    let mut editor = DefaultEditor::new().expect("start the line editor");
+    // Live events print above the prompt; without a terminal (piped input)
+    // there is no prompt to keep clear, so plain stdout is fine.
+    let mut print_event: Box<dyn FnMut(String) + Send> = match editor.create_external_printer() {
+        Ok(mut printer) => Box::new(move |line| {
+            let _ = printer.print(format!("{line}\n"));
+        }),
+        Err(_) => Box::new(|line| println!("{line}")),
+    };
+    let filter = Arc::new(Mutex::new(WatchFilter::default()));
+    {
+        let filter = filter.clone();
+        let json = args.json;
+        std::thread::spawn(move || {
+            let mut last_telemetry = String::new();
+            loop {
+                let Ok(Some(event)) = events.recv() else {
+                    print_event("!! lost the event stream from ds_daemon".to_string());
+                    return;
+                };
+                let shown = filter.lock().expect("filter mutex poisoned").apply(&event);
+                let Some(shown) = shown else { continue };
+                let line = format_line(&shown, json);
+                // Telemetry repeats at 10 Hz; only show changes.
+                if shown["event"] == "telemetry" {
                     if line == last_telemetry {
                         continue;
                     }
                     last_telemetry = line.clone();
-                    line
                 }
-                Event::Stacktrace(trace) => format!("<< STACKTRACE:\n{trace}"),
-                Event::Command { name, extra } => format!("<< command {name}: {extra}"),
-                Event::CommandDropped { name } => format!("!! command {name} never acked"),
-                Event::ProtocolError(e) => format!("!! protocol error: {e}"),
-                Event::WebcamAvailable(available) => format!("<< webcam available: {available}"),
-                Event::WebcamFrame(jpeg) => format!("<< webcam frame: {} bytes", jpeg.len()),
-            };
-            printer.print(format!("{line}\n")).ok();
-        }
-    });
+                print_event(line);
+            }
+        });
+    }
 
-    let mut last_inited = String::new();
-    while let Ok(line) = rl.readline("> ") {
-        rl.add_history_entry(line.as_str()).ok();
-        let mut parts = line.trim().splitn(2, ' ');
-        match (parts.next().unwrap_or(""), parts.next()) {
-            ("list", _) => client.request_opmode_list(),
-            ("init", Some(name)) => {
-                last_inited = name.to_string();
-                client.init_opmode(name);
+    while let Ok(line) = editor.readline("> ") {
+        let _ = editor.add_history_entry(line.as_str());
+        let words = match split_line(&line) {
+            Ok(words) => words,
+            Err(e) => {
+                println!("{}", format_line(&bad_args(e), args.json));
+                continue;
             }
-            ("run", name) => {
-                let name = name.unwrap_or(&last_inited);
-                if name.is_empty() {
-                    println!("!! nothing inited; use: init <name>");
-                } else {
-                    client.run_opmode(name);
-                }
+        };
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        match words.first().copied() {
+            None => continue,
+            Some("quit" | "exit") => break,
+            Some("help") => {
+                println!("{}", help());
+                continue;
             }
-            ("stop", _) => client.stop_opmode(),
-            ("restart", _) => client.restart_robot(),
-            ("connect", _) => client.connect(),
-            ("disconnect", _) => client.disconnect(),
-            ("active-config", _) => client.request_active_config(),
-            ("configs", _) => client.request_configurations(),
-            ("config", Some(name)) => match find_config(&known_configs, name) {
-                Some(meta) => client.request_particular_configuration(&meta),
-                None => println!("!! unknown config {name:?}; run `configs` first"),
-            },
-            ("save-config", Some(json)) => client.save_configuration(json),
-            ("activate-config", Some(name)) => match find_config(&known_configs, name) {
-                Some(meta) => client.activate_configuration(&meta),
-                None => println!("!! unknown config {name:?}; run `configs` first"),
-            },
-            ("delete-config", Some(name)) => match find_config(&known_configs, name) {
-                Some(meta) => client.delete_configuration(&meta),
-                None => println!("!! unknown config {name:?}; run `configs` first"),
-            },
-            ("config" | "save-config" | "activate-config" | "delete-config", None) => {
-                println!("!! missing argument")
+            // Here `watch` narrows what this prompt shows; the stream itself
+            // is already running.
+            Some("watch") => {
+                let reply = match WatchFilter::parse(&words[1..]) {
+                    Ok(new_filter) => {
+                        *filter.lock().expect("filter mutex poisoned") = new_filter;
+                        json!({"ok": true})
+                    }
+                    Err(e) => bad_args(e),
+                };
+                println!("{}", format_line(&reply, args.json));
+                continue;
             }
-            ("device-types", _) => client.request_user_device_types(),
-            ("scan", _) => client.scan(),
-            ("lynx-modules", Some(serial)) => client.discover_lynx_modules(serial),
-            ("lynx-modules", None) => {
-                println!("!! missing argument (LynxUsbDevice serial from `scan`)")
-            }
-            ("w", _) => {
-                client.send_gamepad(Gamepad {
-                    left_stick_y: FORWARD_STICK,
-                    ..Default::default()
-                });
-                std::thread::sleep(PULSE);
-                client.send_gamepad(Gamepad::default());
-            }
-            ("quit" | "exit", _) => break,
-            ("", _) => {}
-            (other, _) => println!("!! unknown command: {other}"),
+            Some(_) => {}
         }
+        let request = match parse(&words) {
+            Ok(request) => request,
+            Err(e) => {
+                println!("{}", format_line(&bad_args(e), args.json));
+                continue;
+            }
+        };
+        match session.request(&request) {
+            Ok(reply) => println!("{}", format_line(&reply, args.json)),
+            Err(e) => {
+                println!("!! daemon_unreachable: {e}");
+                break;
+            }
+        }
+        if request == Request::Shutdown {
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(words: &[&str]) -> Result<Args, String> {
+        parse_args(&words.iter().map(|w| w.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn flags_parse() {
+        assert_eq!(
+            args(&[]),
+            Ok(Args {
+                json: false,
+                peer: None
+            })
+        );
+        assert_eq!(
+            args(&["--json", "--peer", "10.0.0.5"]),
+            Ok(Args {
+                json: true,
+                peer: Some("10.0.0.5".into())
+            })
+        );
+        assert!(args(&["--peer"]).is_err());
+        assert!(args(&["10.0.0.5"]).is_err());
+    }
+
+    #[test]
+    fn help_lists_every_verb() {
+        let text = help();
+        for verb in PARSE_TABLE {
+            assert!(text.contains(verb.usage), "help is missing {}", verb.name);
+        }
+    }
+
+    #[test]
+    fn lines_are_text_unless_json_is_asked_for() {
+        let reply = json!({"ok": false, "error": "bad_args", "message": "no"});
+        assert_eq!(format_line(&reply, false), "!! bad_args: no");
+        assert_eq!(format_line(&reply, true), reply.to_string());
     }
 }
