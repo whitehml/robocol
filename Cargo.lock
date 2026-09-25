@@ -33,25 +33,7 @@ dependencies = [
 name = "ds_agent"
 version = "0.1.0"
 dependencies = [
- "ds_agent_ipc",
- "serde_json",
-]
-
-[[package]]
-name = "ds_agent_ipc"
-version = "0.1.0"
-dependencies = [
- "libc",
- "serde_json",
-]
-
-[[package]]
-name = "ds_agentd"
-version = "0.1.0"
-dependencies = [
- "ds_agent_ipc",
- "robocol",
- "serde",
+ "ds_proto",
  "serde_json",
 ]
 
@@ -61,6 +43,24 @@ version = "0.1.0"
 dependencies = [
  "robocol",
  "rustyline",
+]
+
+[[package]]
+name = "ds_daemon"
+version = "0.1.0"
+dependencies = [
+ "ds_proto",
+ "robocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ds_proto"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
 ]
 
 [[package]]

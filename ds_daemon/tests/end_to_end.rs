@@ -1,4 +1,4 @@
-//! Drives the full `ds_agent` -> `ds_agentd` -> `fake_rc` stack the way a
+//! Drives the full `ds_agent` -> `ds_daemon` -> `fake_rc` stack the way a
 //! human would drive `ds_cli` -> a real Control Hub, but scripted.
 //!
 //! The two tests here use different runtime dirs and UDP ports, so cargo may
@@ -26,7 +26,7 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// `cargo test -p ds_agentd` only builds this crate's own binaries, so build
+/// `cargo test -p ds_daemon` only builds this crate's own binaries, so build
 /// the sibling crates a test drives before touching them.
 fn build_bins(packages: &[&str]) {
     let mut cmd = Command::new(env!("CARGO"));
@@ -42,10 +42,10 @@ fn build_bins(packages: &[&str]) {
 }
 
 fn bin_path(name: &str) -> PathBuf {
-    // CARGO_BIN_EXE_ds_agentd is set for this crate's own binary; sibling
+    // CARGO_BIN_EXE_ds_daemon is set for this crate's own binary; sibling
     // binaries built by build_bins() share the same target/debug dir, one
-    // level up from ds_agentd's own exe path.
-    let mut path = PathBuf::from(env!("CARGO_BIN_EXE_ds_agentd"));
+    // level up from ds_daemon's own exe path.
+    let mut path = PathBuf::from(env!("CARGO_BIN_EXE_ds_daemon"));
     path.pop();
     path.push(name);
     path
@@ -108,7 +108,7 @@ fn drives_an_opmode_and_watches_telemetry_against_fake_rc() {
     );
 
     let mut daemon = ChildGuard(
-        Command::new(bin_path("ds_agentd"))
+        Command::new(bin_path("ds_daemon"))
             .args([
                 "--peer",
                 "127.0.0.1",
@@ -118,18 +118,18 @@ fn drives_an_opmode_and_watches_telemetry_against_fake_rc() {
                 "0",
             ])
             .env("XDG_RUNTIME_DIR", &tmp)
-            .env("DS_AGENT_TIMEOUT_MS", "2000")
+            .env("DS_DAEMON_TIMEOUT_MS", "2000")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("start ds_agentd"),
+            .expect("start ds_daemon"),
     );
 
     // Wait for the daemon's socket to exist before sending anything.
-    let socket_path = tmp.join("ds_agentd.sock");
+    let socket_path = tmp.join("ds_daemon.sock");
     assert!(
         wait_until(Duration::from_secs(3), || socket_path.exists()),
-        "ds_agentd socket never appeared"
+        "ds_daemon socket never appeared"
     );
 
     // Wait for the daemon to actually connect to fake_rc (discovery + a
@@ -139,7 +139,7 @@ fn drives_an_opmode_and_watches_telemetry_against_fake_rc() {
             Duration::from_secs(3),
             || run_agent(&tmp, &["status"])["connected"] == true
         ),
-        "ds_agentd never connected to fake_rc"
+        "ds_daemon never connected to fake_rc"
     );
 
     let list = run_agent(&tmp, &["list"]);
@@ -236,7 +236,7 @@ fn auto_spawns_daemon_logs_it_and_stops_it() {
     // Port 1: nothing answers, so no fake_rc is needed and nothing clashes
     // with the other test (or a running Deck Station on 20884).
     let env: Vec<(&str, &str)> = vec![(
-        "DS_AGENTD_ARGS",
+        "DS_DAEMON_ARGS",
         "--peer 127.0.0.1 --peer-port 1 --bind-port 0",
     )];
     let guard = SpawnedDaemonGuard {
@@ -249,7 +249,7 @@ fn auto_spawns_daemon_logs_it_and_stops_it() {
     assert_eq!(status["ok"], true, "status reply: {status}");
     assert_eq!(status["connected"], false);
 
-    let log = tmp.join("ds_agentd.log");
+    let log = tmp.join("ds_daemon.log");
     assert!(
         log.exists(),
         "spawned daemon's log {} missing",
@@ -262,11 +262,11 @@ fn auto_spawns_daemon_logs_it_and_stops_it() {
     let stopped = run_agent_with_env(&tmp, &["daemon", "stop"], &env);
     assert_eq!(stopped["ok"], true, "daemon stop reply: {stopped}");
 
-    let socket = tmp.join("ds_agentd.sock");
+    let socket = tmp.join("ds_daemon.sock");
     assert!(
         wait_until(Duration::from_secs(2), || UnixStream::connect(&socket)
             .is_err()),
-        "ds_agentd still accepting connections after `daemon stop`"
+        "ds_daemon still accepting connections after `daemon stop`"
     );
 
     drop(guard); // best-effort second stop is a no-op; removes the dir

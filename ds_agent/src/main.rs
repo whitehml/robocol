@@ -1,4 +1,4 @@
-//! Non-interactive CLI for `ds_agentd`. One invocation, one JSON request,
+//! Non-interactive front end for `ds_daemon`. One invocation, one JSON request,
 //! one reply on stdout — see `ds_cli` for the interactive REPL this mirrors.
 //!
 //! ```sh
@@ -8,7 +8,7 @@
 //! ds_agent gamepad --left-stick-y -0.5 --duration 300ms
 //! ds_agent watch --types telemetry
 //! ds_agent daemon status
-//! DS_AGENTD_ARGS="--peer 192.168.43.1 --bind-port 0" ds_agent status   # extra ds_agentd flags on auto-spawn
+//! DS_DAEMON_ARGS="--peer 192.168.43.1 --bind-port 0" ds_agent status   # extra ds_daemon flags on auto-spawn
 //! ```
 
 use std::io::BufReader;
@@ -167,15 +167,15 @@ fn build_watch_request(args: &[String]) -> Result<serde_json::Value, String> {
 /// Connects to the daemon, spawning it detached (its own process group) if
 /// needed. A spawned daemon's stdout and stderr are redirected to a `.log`
 /// file beside the socket, so a crash or panic during startup can be
-/// diagnosed after the fact. If `DS_AGENTD_ARGS` is set, it is split on
-/// whitespace and passed through as extra `ds_agentd` arguments.
+/// diagnosed after the fact. If `DS_DAEMON_ARGS` is set, it is split on
+/// whitespace and passed through as extra `ds_daemon` arguments.
 fn connect_or_spawn() -> Result<UnixStream, String> {
-    let path = ds_agent_ipc::socket_path();
+    let path = ds_proto::socket_path();
     if let Ok(stream) = UnixStream::connect(&path) {
         return Ok(stream);
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let daemon_path = exe.with_file_name("ds_agentd");
+    let daemon_path = exe.with_file_name("ds_daemon");
     let log_path = path.with_extension("log");
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -186,7 +186,7 @@ fn connect_or_spawn() -> Result<UnixStream, String> {
         .try_clone()
         .map_err(|e| format!("failed to open {}: {e}", log_path.display()))?;
     let mut command = std::process::Command::new(&daemon_path);
-    if let Ok(extra) = std::env::var("DS_AGENTD_ARGS") {
+    if let Ok(extra) = std::env::var("DS_DAEMON_ARGS") {
         command.args(extra.split_whitespace());
     }
     command
@@ -210,7 +210,7 @@ fn connect_or_spawn() -> Result<UnixStream, String> {
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "ds_agentd did not become ready in time; see {}",
+                "ds_daemon did not become ready in time; see {}",
                 log_path.display()
             ));
         }
@@ -231,14 +231,14 @@ fn print_unreachable(message: &str) -> ! {
 /// Sends one request over an already-connected stream and reads one reply
 /// line; `None` when the daemon closed without answering.
 fn round_trip(mut stream: UnixStream, request: &serde_json::Value) -> Option<serde_json::Value> {
-    ds_agent_ipc::write_message(&mut stream, request).ok()?;
+    ds_proto::write_message(&mut stream, request).ok()?;
     let mut reader = BufReader::new(stream);
-    let line = ds_agent_ipc::read_message(&mut reader).ok().flatten()?;
+    let line = ds_proto::read_message(&mut reader).ok().flatten()?;
     serde_json::from_str(&line).ok()
 }
 
 fn run_daemon_subcommand(args: &[String]) -> i32 {
-    let path = ds_agent_ipc::socket_path();
+    let path = ds_proto::socket_path();
     match args.first().map(String::as_str) {
         Some("status") => match UnixStream::connect(&path) {
             Ok(stream) => match round_trip(stream, &serde_json::json!({"cmd": "status"})) {
@@ -251,7 +251,7 @@ fn run_daemon_subcommand(args: &[String]) -> i32 {
                     println!("{status}");
                     0
                 }
-                None => print_unreachable("ds_agentd accepted the connection but did not answer"),
+                None => print_unreachable("ds_daemon accepted the connection but did not answer"),
             },
             Err(_) => {
                 println!(r#"{{"ok":true,"running":false}}"#);
@@ -264,7 +264,7 @@ fn run_daemon_subcommand(args: &[String]) -> i32 {
                     println!("{reply}");
                     0
                 }
-                _ => print_unreachable("ds_agentd did not acknowledge shutdown"),
+                _ => print_unreachable("ds_daemon did not acknowledge shutdown"),
             },
             Err(_) => {
                 println!(r#"{{"ok":true,"running":false}}"#);
@@ -297,18 +297,18 @@ fn main() {
         Ok(s) => s,
         Err(msg) => print_unreachable(&msg),
     };
-    if ds_agent_ipc::write_message(&mut stream, &request).is_err() {
-        print_unreachable("failed to write to ds_agentd");
+    if ds_proto::write_message(&mut stream, &request).is_err() {
+        print_unreachable("failed to write to ds_daemon");
     }
 
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
     if is_watch {
-        while let Ok(Some(line)) = ds_agent_ipc::read_message(&mut reader) {
+        while let Ok(Some(line)) = ds_proto::read_message(&mut reader) {
             println!("{line}");
         }
         return;
     }
-    match ds_agent_ipc::read_message(&mut reader) {
+    match ds_proto::read_message(&mut reader) {
         Ok(Some(line)) => {
             println!("{line}");
             let ok = serde_json::from_str::<serde_json::Value>(&line)
@@ -317,7 +317,7 @@ fn main() {
             std::process::exit(if ok { 0 } else { 1 });
         }
         _ => {
-            eprintln!("no response from ds_agentd");
+            eprintln!("no response from ds_daemon");
             std::process::exit(1);
         }
     }

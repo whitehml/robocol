@@ -1,7 +1,6 @@
-//! Headless daemon: owns one persistent `robocol::RobocolClient` connection
-//! and answers `ds_agent` over a Unix domain socket. See
-//! `docs/superpowers/specs/2026-09-10-headless-driver-station-agent-design.md`
-//! in the deck-station repo for the wire protocol this implements.
+//! `ds_daemon`: owns the one `robocol::RobocolClient` connection to the Robot
+//! Controller and serves its front ends (`ds_agent`, `ds_cli`) over a Unix
+//! domain socket, one JSON object per line. See the repo README for usage.
 
 mod connection;
 mod request;
@@ -55,10 +54,10 @@ fn parse_args() -> Args {
     args
 }
 
-/// Timeout for request/response commands. `DS_AGENT_TIMEOUT_MS` lets tests
+/// Timeout for request/response commands. `DS_DAEMON_TIMEOUT_MS` lets tests
 /// use something far shorter than the 5s production default.
 fn resolve_timeout() -> Duration {
-    std::env::var("DS_AGENT_TIMEOUT_MS")
+    std::env::var("DS_DAEMON_TIMEOUT_MS")
         .ok()
         .and_then(|s| s.parse().ok())
         .map(Duration::from_millis)
@@ -70,16 +69,16 @@ fn resolve_timeout() -> Duration {
 /// the process immediately rather than running two daemons against one
 /// robot connection.
 fn bind_socket() -> UnixListener {
-    let path = ds_agent_ipc::socket_path();
+    let path = ds_proto::socket_path();
     match UnixListener::bind(&path) {
         Ok(listener) => listener,
         Err(_) => {
             if UnixStream::connect(&path).is_ok() {
-                eprintln!("ds_agentd already running at {}", path.display());
+                eprintln!("ds_daemon already running at {}", path.display());
                 std::process::exit(0);
             }
             let _ = std::fs::remove_file(&path);
-            UnixListener::bind(&path).expect("bind ds_agentd socket after clearing stale file")
+            UnixListener::bind(&path).expect("bind ds_daemon socket after clearing stale file")
         }
     }
 }
@@ -107,11 +106,11 @@ fn main() {
         Ok(started) => started,
         Err(e) => {
             eprintln!(
-                "ds_agentd: cannot bind UDP port {bind_port}: {e} (is Deck Station or ds_cli already running?)"
+                "ds_daemon: cannot bind UDP port {bind_port}: {e} (is Deck Station or ds_cli already running?)"
             );
             // Don't leave a socket file that ds_agent would mistake for a
             // live daemon.
-            let _ = std::fs::remove_file(ds_agent_ipc::socket_path());
+            let _ = std::fs::remove_file(ds_proto::socket_path());
             std::process::exit(1);
         }
     };
@@ -142,7 +141,7 @@ fn main() {
             // The robocol worker only drops its sender when it dies. A
             // daemon with no robot connection must not linger answering
             // `connected: true` from a frozen cache.
-            eprintln!("ds_agentd: robocol client stopped; exiting");
+            eprintln!("ds_daemon: robocol client stopped; exiting");
             std::process::exit(1);
         });
     }

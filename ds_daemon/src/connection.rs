@@ -72,7 +72,7 @@ fn run_watch(
         .subscribe();
     for event in rx {
         if let Some(json) = event_to_watch_json(&event, types.as_deref())
-            && ds_agent_ipc::write_message(stream, &json).is_err()
+            && ds_proto::write_message(stream, &json).is_err()
         {
             break;
         }
@@ -92,13 +92,13 @@ pub fn handle_connection(
         Err(_) => return,
     };
     let mut reader = BufReader::new(reader_stream);
-    let Ok(Some(line)) = ds_agent_ipc::read_message(&mut reader) else {
+    let Ok(Some(line)) = ds_proto::read_message(&mut reader) else {
         return;
     };
     let req: Request = match serde_json::from_str(&line) {
         Ok(r) => r,
         Err(e) => {
-            let _ = ds_agent_ipc::write_message(
+            let _ = ds_proto::write_message(
                 &mut stream,
                 &serde_json::json!({"ok": false, "error": "bad_args", "message": e.to_string()}),
             );
@@ -108,12 +108,12 @@ pub fn handle_connection(
     match req {
         Request::Watch { types } => run_watch(&mut stream, &subscribers, types),
         Request::Shutdown => {
-            let _ = ds_agent_ipc::write_message(&mut stream, &serde_json::json!({"ok": true}));
+            let _ = ds_proto::write_message(&mut stream, &serde_json::json!({"ok": true}));
             std::process::exit(0);
         }
         other => {
             let reply = handle_request(other, &client, &state, &waiters, timeout);
-            let _ = ds_agent_ipc::write_message(&mut stream, &reply);
+            let _ = ds_proto::write_message(&mut stream, &reply);
         }
     }
 }
@@ -148,7 +148,7 @@ mod tests {
     fn ping_round_trips_over_a_real_socket_pair() {
         let (client, state, waiters, subscribers) = deps();
         let (mut cli_side, daemon_side) = UnixStream::pair().unwrap();
-        ds_agent_ipc::write_message(&mut cli_side, &serde_json::json!({"cmd": "ping"})).unwrap();
+        ds_proto::write_message(&mut cli_side, &serde_json::json!({"cmd": "ping"})).unwrap();
         handle_connection(
             daemon_side,
             client,
@@ -193,7 +193,7 @@ mod tests {
     fn watch_streams_only_requested_types() {
         let (client, state, waiters, subscribers) = deps();
         let (mut cli_side, daemon_side) = UnixStream::pair().unwrap();
-        ds_agent_ipc::write_message(
+        ds_proto::write_message(
             &mut cli_side,
             &serde_json::json!({"cmd": "watch", "types": ["disconnected"]}),
         )

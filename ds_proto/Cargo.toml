@@ -1,0 +1,10 @@
+[package]
+name = "ds_proto"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Shared command surface, wire protocol and transport for ds_daemon, ds_cli and ds_agent"
+
+[dependencies]
+serde_json = "1"
+libc = "0.2"

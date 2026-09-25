@@ -1,19 +1,19 @@
-//! Socket path and line-framing shared by `ds_agentd` and `ds_agent`. Both
-//! binaries must resolve the same path and speak the same framing, so this
-//! logic lives once instead of being duplicated on both sides of the pipe.
+//! Socket path and line framing shared by `ds_daemon` and its front ends.
+//! Every process must resolve the same path and speak the same framing, so
+//! this logic lives once instead of being duplicated on each side of the pipe.
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-/// Where `ds_agentd` binds its Unix domain socket and `ds_agent` connects.
+/// Where `ds_daemon` binds its Unix domain socket and `ds_agent` connects.
 /// Prefers `$XDG_RUNTIME_DIR` (cleaned up by the OS on logout); falls back to
 /// a per-user path under `/tmp` so this also works in a plain SSH session.
 pub fn socket_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(dir).join("ds_agentd.sock");
+        return PathBuf::from(dir).join("ds_daemon.sock");
     }
     let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/ds_agentd-{uid}.sock"))
+    PathBuf::from(format!("/tmp/ds_daemon-{uid}.sock"))
 }
 
 /// Writes one JSON value as a single line: the whole `\n`-terminated buffer
@@ -82,7 +82,7 @@ mod tests {
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/tmp/ds-agent-test-runtime") };
         assert_eq!(
             socket_path(),
-            PathBuf::from("/tmp/ds-agent-test-runtime/ds_agentd.sock")
+            PathBuf::from("/tmp/ds-agent-test-runtime/ds_daemon.sock")
         );
         unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
     }

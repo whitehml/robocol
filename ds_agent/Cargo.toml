@@ -3,12 +3,12 @@ name = "ds_agent"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Non-interactive JSON CLI for ds_agentd, for scripting or an AI agent"
+description = "One-shot JSON front end for ds_daemon, for scripts and AI agents"
 
 [[bin]]
 name = "ds_agent"
 path = "src/main.rs"
 
 [dependencies]
-ds_agent_ipc = { path = "../ds_agent_ipc" }
+ds_proto = { path = "../ds_proto" }
 serde_json = "1"
