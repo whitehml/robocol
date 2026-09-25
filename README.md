@@ -88,6 +88,10 @@ target/debug/ds_agent watch --types telemetry --key heading_deg
 target/debug/ds_agent --pretty status        # text instead of JSON
 ```
 
+`watch` flags narrow the stream: `--types` (event types), `--tag`
+(telemetry tag), `--key` (a telemetry line's caption, the part before ` : `
+as in `telemetry.addData("Heading", ...)`, or a number's name).
+
 Errors look like `{"ok":false,"error":"<code>","message":"..."}`.
 
 ### Gamepads

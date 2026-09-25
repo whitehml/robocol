@@ -37,20 +37,23 @@ fn render_event(kind: &str, e: &Value) -> String {
         ),
         "state" => format!("<< robot state: {}", text(&e["state"])),
         "telemetry" => {
-            let mut line = format!("<< telemetry [{}]", text(&e["tag"]));
-            for section in ["strings", "numbers"] {
-                if let Some(map) = e[section].as_object() {
-                    for (key, value) in map {
-                        // `telemetry.addLine()` text arrives with an empty key.
-                        if key.is_empty() {
-                            line.push_str(&format!(" {}", text(value)));
-                        } else {
-                            line.push_str(&format!(" {key}={}", text(value)));
-                        }
-                    }
+            let mut parts = Vec::new();
+            for line in e["strings"].as_array().into_iter().flatten() {
+                let key = line[0].as_str().unwrap_or_default();
+                let value = text(&line[1]);
+                // Reserved keys (`$Robot$Battery$Level$`, `$System$...`) name
+                // their line; an ordinary line's key is an opaque sort tag
+                // and its text already reads "Caption : Data".
+                if key.starts_with('$') {
+                    parts.push(format!("{key}={value}"));
+                } else {
+                    parts.push(value);
                 }
             }
-            line
+            for (name, value) in e["numbers"].as_object().into_iter().flatten() {
+                parts.push(format!("{name}={}", text(value)));
+            }
+            format!("<< telemetry [{}] {}", text(&e["tag"]), parts.join(" | "))
         }
         "stacktrace" => format!("<< STACKTRACE:\n{}", text(&e["trace"])),
         "command_dropped" => format!("!! command {} never acked", text(&e["name"])),
@@ -132,20 +135,14 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_is_one_line_of_key_values() {
+    fn telemetry_shows_each_line_in_order() {
         let event = json!({"event": "telemetry", "tag": "T",
-            "strings": {"Alliance": "RED"}, "numbers": {"heading_deg": 12.5}});
+            "strings": [["$Robot$Battery$Level$", "12.80"], ["\u{1}", "Alliance : RED"], ["", "Hint : X toggles"]],
+            "numbers": {"heading_deg": 12.5}});
         assert_eq!(
             render(&event),
-            "<< telemetry [T] Alliance=RED heading_deg=12.5"
+            "<< telemetry [T] $Robot$Battery$Level$=12.80 | Alliance : RED | Hint : X toggles | heading_deg=12.5"
         );
-    }
-
-    #[test]
-    fn telemetry_lines_without_a_key_show_as_text() {
-        let event = json!({"event": "telemetry", "tag": "T",
-            "strings": {"": "Hint : X toggles alliance"}, "numbers": {}});
-        assert_eq!(render(&event), "<< telemetry [T] Hint : X toggles alliance");
     }
 
     #[test]

@@ -3,7 +3,23 @@
 //! up to each client (`ds_proto::WatchFilter`).
 
 use robocol::client::Event;
+use robocol::packets::Telemetry;
 use serde_json::{Map, Value, json};
+
+/// A telemetry packet's lines and numbers as JSON, for `watch` and
+/// `status`. `strings` stays an ordered list of `[key, value]` pairs: a real
+/// RC keys each ordinary line by an opaque sort tag (and `fake_rc` by an
+/// empty key), with "Caption : Data" in the value, so a map would drop and
+/// re-sort lines. `numbers` are keyed by real names.
+pub fn telemetry_json(t: &Telemetry) -> Value {
+    let strings: Vec<Value> = t.strings.iter().map(|(k, v)| json!([k, v])).collect();
+    let numbers: Map<String, Value> = t
+        .numbers
+        .iter()
+        .map(|(k, v)| (k.clone(), json!(v)))
+        .collect();
+    json!({"strings": strings, "numbers": numbers})
+}
 
 /// `None` for events with no watch representation: request replies such as
 /// `OpModeList`, and raw webcam frames.
@@ -14,17 +30,10 @@ pub fn watch_json(event: &Event) -> Option<Value> {
         Event::PeerBusy { peer } => json!({"event": "peer_busy", "peer": peer.to_string()}),
         Event::RobotState(s) => json!({"event": "state", "state": format!("{s:?}")}),
         Event::Telemetry(t) => {
-            let strings: Map<String, Value> = t
-                .strings
-                .iter()
-                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
-                .collect();
-            let numbers: Map<String, Value> = t
-                .numbers
-                .iter()
-                .map(|(k, v)| (k.clone(), json!(v)))
-                .collect();
-            json!({"event": "telemetry", "tag": t.tag, "strings": strings, "numbers": numbers})
+            let mut event = telemetry_json(t);
+            event["event"] = json!("telemetry");
+            event["tag"] = json!(t.tag);
+            event
         }
         Event::Stacktrace(trace) => json!({"event": "stacktrace", "trace": trace}),
         Event::CommandDropped { name } => json!({"event": "command_dropped", "name": name}),
@@ -42,10 +51,14 @@ mod tests {
     use robocol::packets::Telemetry;
 
     #[test]
-    fn telemetry_becomes_strings_and_numbers_maps() {
+    fn telemetry_keeps_every_line_in_order() {
         let mut t = Telemetry {
             tag: "TELEMETRY_DATA".into(),
-            strings: vec![("Alliance".into(), "RED".into())],
+            strings: vec![
+                ("$Robot$Battery$Level$".into(), "12.80".into()),
+                (String::new(), "OpMode : Duo".into()),
+                (String::new(), "Alliance : RED".into()),
+            ],
             ..Default::default()
         };
         t.numbers.insert("heading_deg".into(), 12.5);
@@ -55,7 +68,11 @@ mod tests {
             json!({
                 "event": "telemetry",
                 "tag": "TELEMETRY_DATA",
-                "strings": {"Alliance": "RED"},
+                "strings": [
+                    ["$Robot$Battery$Level$", "12.80"],
+                    ["", "OpMode : Duo"],
+                    ["", "Alliance : RED"],
+                ],
                 "numbers": {"heading_deg": 12.5},
             })
         );

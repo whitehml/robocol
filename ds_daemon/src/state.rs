@@ -96,22 +96,7 @@ impl DaemonState {
         let telemetry: serde_json::Map<String, serde_json::Value> = self
             .telemetry
             .iter()
-            .map(|(tag, t)| {
-                let strings: serde_json::Map<String, serde_json::Value> = t
-                    .strings
-                    .iter()
-                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                    .collect();
-                let numbers: serde_json::Map<String, serde_json::Value> = t
-                    .numbers
-                    .iter()
-                    .map(|(k, v)| (k.clone(), serde_json::json!(v)))
-                    .collect();
-                (
-                    tag.clone(),
-                    serde_json::json!({"strings": strings, "numbers": numbers}),
-                )
-            })
+            .map(|(tag, t)| (tag.clone(), crate::watch::telemetry_json(t)))
             .collect();
         serde_json::json!({
             "ok": true,
