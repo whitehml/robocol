@@ -43,10 +43,10 @@ impl Default for PeerDiscovery {
             seq: 0,
             robocol_version: 124,
             peer_type: PeerType::Peer,
-            sdk_build_month: 7,
+            sdk_build_month: 9,
             sdk_build_year: 2026,
-            sdk_major_version: 11,
-            sdk_minor_version: 2,
+            sdk_major_version: 12,
+            sdk_minor_version: 0,
         }
     }
 }
@@ -88,7 +88,7 @@ mod tests {
     #[test]
     fn golden_bytes() {
         let bytes = PeerDiscovery::default().serialize();
-        assert_eq!(bytes, vec![3, 0, 10, 124, 1, 0, 0, 7, 0x07, 0xEA, 11, 2, 0]);
+        assert_eq!(bytes, vec![3, 0, 10, 124, 1, 0, 0, 9, 0x07, 0xEA, 12, 0, 0]);
     }
 
     #[test]

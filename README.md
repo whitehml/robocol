@@ -38,13 +38,21 @@ end-to-end test needs no external binary.
 
 ## Supported Robot Controller versions
 
-**`11.0`–`11.1`**
+**`11.0`–`12.0`**
 
 > [!NOTE]
 > **This stack first targeted FTC Robot Controller v11.0.** The wire formats
 > were confirmed against a live capture — not against a spec. Older FTC SDK
 > releases may use different packet layouts, command vocabularies, or defaults
 > and are **not supported**. They may still work, but you are on your own.
+
+The SDK version in `PeerDiscovery::default()` must track the newest supported
+RC. The RC's `SoftwareVersionWarningSource` compares the major/minor we
+advertise against its own and the build month against the current FTC season,
+and raises a persistent "Driver Station app is obsolete" global warning on a
+mismatch. That warning is cosmetic, but it rides in every `$System$Warning$`
+telemetry bundle. Nothing else in the RC branches on these fields, so they
+affect the warning only, never framing.
 
 ## Packet capture
 
